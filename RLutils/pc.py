@@ -5,7 +5,7 @@ import numpy as np
 class FakePlaceCells(object):
 
     def __init__(self, env, size=300, sd=3, seed=42, normalize=True):
-        self.env = env
+        self.env = env.env
         self.size = size
         self.sd = np.tile(sd, (2, size))
         self.means = np.zeros((2, size), dtype=int)

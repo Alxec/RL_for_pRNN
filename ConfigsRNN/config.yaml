@@ -19,7 +19,7 @@ prnn:
   trainBias: True # Whether to train bias
   identityInit: False # Whether to initialize weights with identity matrix
   mean_std_ratio: 1.0 # Ratio for lognormal weight initialization
-  sparsity: 0.1 # Recurrent weight sparsity for lognormal pRNNs
+  sparsity: 0.05 # Recurrent weight sparsity for lognormal pRNNs
   latent_dim: 32 # Dimension of the latent space in pRNN-AE; if 0, uses hidden layer of the RNN
 
 

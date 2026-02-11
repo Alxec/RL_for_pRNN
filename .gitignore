@@ -3,10 +3,11 @@ Figures/*
 LabNotebook/*
 nets/*
 RLvideos/*
-RLutils/__pycache__/*
+**/__pycache__/*
 *.sh
 *.pyc
 *.ipynb
 test*
 
 trainRL.py
+train_RL.py

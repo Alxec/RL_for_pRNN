@@ -113,12 +113,13 @@ class EnvironmentFeaturesAnalysis:
     """
     Class for analyzing the features of the environment learned or used by RL agent.
     """
-    def __init__(self, env, agent, rl_model = None, prnn_model = None, timesteps = 10000):
+    def __init__(self, env, agent, rl_model = None, prnn_model = None, timesteps = 10000, PC = None):
         self.env = env
         self.agent = agent # agent to collect observations
         self.rl_model = rl_model
         self.prnn = prnn_model
         self.timesteps = timesteps
+        self.PC = PC
         _, self.preprocess_obss = get_obss_preprocessor(self.env.observation_space)
 
         self.data = self.collect_data()
@@ -138,6 +139,11 @@ class EnvironmentFeaturesAnalysis:
             with torch.no_grad():
                 _, _, data['h'] = self.prnn.predict(prnn_obs.to(device), prnn_act.to(device))
 
+        elif self.PC:
+            print('Collecting PC observations...')
+            data['obs'], _, data['state'], _ = self.agent.getObservations(self.env, self.timesteps)
+            data['h'] = torch.tensor([self.PC.activation(pos) for pos in data['state']['agent_pos']],
+                                     dtype=torch.float32, device=device).unsqueeze(0)
         else:
             print('Collecting environment observations...')
             data['obs'], _, data['state'], _ = self.agent.getObservations(self.env, self.timesteps)
@@ -156,7 +162,7 @@ class EnvironmentFeaturesAnalysis:
         for t in range(self.timesteps):
             preprocessed_obs = self.preprocess_obss([self.data['obs'][t+1]], device=device)
             with torch.no_grad():
-                if self.prnn:
+                if self.prnn or self.PC:
                     dist, value = self.rl_model(preprocessed_obs, SR=self.data['h'][:,t])
                 else:
                     dist, value = self.rl_model(preprocessed_obs)
@@ -259,13 +265,17 @@ class EnvironmentFeaturesAnalysis:
 
         for t in range(self.timesteps):
             error = cosine(self.data['h'][0,t].to('cpu').numpy(), h_ref)
-            errors_map[self.data['state']['agent_dir'][t+1],
-                       self.data['state']['agent_pos'][t+1, 0]-1,
-                       self.data['state']['agent_pos'][t+1, 1]-1] += error
-            
-            instances_map[self.data['state']['agent_dir'][t+1],
-                          self.data['state']['agent_pos'][t+1, 0]-1,
-                          self.data['state']['agent_pos'][t+1, 1]-1] += 1
+            if self.PC:
+                n = t
+            else:
+                n = t+1
+            errors_map[self.data['state']['agent_dir'][n],
+                       self.data['state']['agent_pos'][n, 0]-1,
+                       self.data['state']['agent_pos'][n, 1]-1] += error
+
+            instances_map[self.data['state']['agent_dir'][n],
+                          self.data['state']['agent_pos'][n, 0]-1,
+                          self.data['state']['agent_pos'][n, 1]-1] += 1
         
         errors_map /= instances_map
 

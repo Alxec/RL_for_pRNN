@@ -132,18 +132,23 @@ class ACModel(nn.Module, torch_ac.ACModel):
             return self.image_embedding_size
     
     def CV(self, obs_space):
+        n = obs_space["image"][0]
+        m = obs_space["image"][1]
+        if n<7 or m<7:
+            last_kernel_size = (1,1)
+            self.image_embedding_size = ((n-1)//2-1)*((m-1)//2-1)*64
+        else:
+            last_kernel_size = (2,2)
+            self.image_embedding_size = ((n-1)//2-2)*((m-1)//2-2)*64
         self.image_conv = nn.Sequential(
             nn.Conv2d(3, 16, (2, 2)),
             nn.ReLU(),
             nn.MaxPool2d((2, 2)),
             nn.Conv2d(16, 32, (2, 2)),
             nn.ReLU(),
-            nn.Conv2d(32, 64, (2, 2)),
+            nn.Conv2d(32, 64, last_kernel_size),
             nn.ReLU()
         )
-        n = obs_space["image"][0]
-        m = obs_space["image"][1]
-        self.image_embedding_size = ((n-1)//2-2)*((m-1)//2-2)*64
 
     def forward(self, obs, **kwargs):
         x = obs.image.transpose(1, 3).transpose(2, 3)
@@ -188,18 +193,7 @@ class ACModelSR(ACModel):
     
     def CV(self, obs_space):
         if self.with_CV:
-            self.image_conv = nn.Sequential(
-                nn.Conv2d(3, 16, (2, 2)),
-                nn.ReLU(),
-                nn.MaxPool2d((2, 2)),
-                nn.Conv2d(16, 32, (2, 2)),
-                nn.ReLU(),
-                nn.Conv2d(32, 64, (2, 2)),
-                nn.ReLU()
-            )
-            n = obs_space["image"][0]
-            m = obs_space["image"][1]
-            self.image_embedding_size = ((n-1)//2-2)*((m-1)//2-2)*64
+            super().CV(obs_space)
         else:
             self.image_embedding_size = 0
 

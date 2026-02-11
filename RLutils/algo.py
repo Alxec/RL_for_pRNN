@@ -23,7 +23,7 @@ class PredictivePPOAlgo:
                  gae_lambda=0.95, entropy_coef=0.01, value_loss_coef=0.5, max_grad_norm=0.5, recurrence=1,
                  adam_eps=1e-8, clip_eps=0.2, epochs=4, batch_size=256, preprocess_obss=None, place_cells=None,
                  cann=None, train_pN=False, noise_mu=0, noise_std=0.03, prnn_seqdur=0, intrinsic=False, k_int=1,
-                 pastSR=False, curious_agent=False, k_curious=1):
+                 pastSR=False, curious_agent=False, k_curious=1, exploration=False, mask_indices=None):
         """
         Initializes a `BaseAlgo` instance.
 
@@ -83,12 +83,17 @@ class PredictivePPOAlgo:
         self.pastSR = pastSR
         self.curious_agent = curious_agent
         self.k_curious = k_curious
+        self.exploration = exploration
+        self.mask_indices = mask_indices
         assert pastSR ^ ('Next' in str(env.encodeAction))
 
         if hasattr(self.env, 'loc_mask'):
             self.loc_mask = self.env.loc_mask
+        elif 'Shell' in str(type(env)):
+            self.loc_mask = [x==None or x.can_overlap() for x in env.env.grid.grid]
         else:
             self.loc_mask = [x==None or x.can_overlap() for x in env.grid.grid]
+
         if self.pN and 'thcyc' in str(self.pN.pRNN):
             self.theta = True
             self.k = self.pN.pRNN.k + 1
@@ -168,13 +173,17 @@ class PredictivePPOAlgo:
             action, dist, value, memory, det_action = self.next_experience()
 
             obs, reward, terminated, truncated, _ = self.env.step(det_action)
+            if self.exploration:
+                reward, terminated, truncated = 0, False, False
             loc = self.agent_pos()
             done = terminated or truncated
 
             # Update spatial representation
             if self.pastSR:
+                # using the obs obtained at the previous step
                 SR = self.next_SR(det_action, self.obs)
             else:
+                # using the obs obtained at the current step
                 SR = self.next_SR(det_action, obs)
 
             # Update experiences values
@@ -183,9 +192,9 @@ class PredictivePPOAlgo:
             self.obs = obs
             self.locs[i] = self.loc
             self.loc = loc
-            # SR at step i is the one use to get act[i] (from step i-1 for pastSR)
+            # SR at step i is the one used to get act[i] (from step i-1 for pastSR)
             self.SRs[i] = self.SR
-            self.SR = SR
+            self.SR = SR # self.SR recorded at step i is the one used to get act[i+1]
             # if self.acmodel.recurrent: # Not using it now, disabled for efficiency
             #     self.memories[i] = self.memory
             #     self.memory = memory
@@ -201,7 +210,10 @@ class PredictivePPOAlgo:
             self.log_probs[i] = dist.log_prob(action)
 
             #add counts to joint probs
-            hd = self.obss[i]["direction"]
+            try:
+                hd = self.obss[i]["direction"]
+            except KeyError:
+                hd = self.obss[i]["HD"]
             x, y = self.locs[i]
             act_probs = dist.probs.detach().cpu().numpy().squeeze()
             joint_probabilities[hd, x, y, :] += act_probs
@@ -616,7 +628,7 @@ class PredictivePPOAlgo:
                 SR = self.pN.predict_single(obs_pN[:,:-1,:], act_pN).squeeze(dim=0)
 
         elif self.PC: # not calculating it on the same step for now
-            SR = torch.tensor(self.PC.activation(self.env.agent_pos), dtype=torch.float32, device=self.device).unsqueeze(dim=0)
+            SR = torch.tensor(self.PC.activation(self.env.env.agent_pos), dtype=torch.float32, device=self.device).unsqueeze(dim=0)
         # Not using the CANNs anymore, so not solving the preprocessed_obs problem
         # elif self.CANN: # not calculating it on the same step for now
         #     with torch.no_grad():
@@ -625,6 +637,9 @@ class PredictivePPOAlgo:
         
         else:
             SR = torch.tensor([], device=self.device).unsqueeze(dim=0)
+
+        if self.mask_indices is not None:
+            SR[0,self.mask_indices] = 0
         return SR
     
 

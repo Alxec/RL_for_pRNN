@@ -1,8 +1,5 @@
 import torch
 import numpy as np
-from numpy.random import choice
-from prnn.utils.predictiveNet import PredictiveNet
-from collections import defaultdict
 
 import RLutils
 from .other import device
@@ -60,7 +57,7 @@ class Agent:
         return self.analyze_feedbacks([reward], [done])
 
 
-class ActorCriticAgent():
+class ActorCriticAgent:
 
     def __init__(self, action_space, acmodel, prnn, device, pastSR=True):
         self.action_space = action_space

@@ -13,8 +13,8 @@ hydra:
     dir: .
 
 exp:
-    env_name: MiniGrid-Lava-Corners-neg05-v2 # Name of the environment to train on [MiniGrid-DonutLava-Long-neg05-v2]
-    opt_return: 0.89 # Optimal return for the environment
+    env_name: MiniGrid-DonutLava-Long-neg05-v0 # Name of the environment to train on [MiniGrid-DonutLava-Long-neg05-v2]
+    opt_return: 0.85 # Optimal return for the environment
     # wrapper: 
     #   _target_: minigrid.wrappers.RGBImgPartialObsWrapper_HD # Environment wrapper as python class
     input_type: 'FO' # ['Visual_FO', 'Visual_PO', 'PC', 'CANN', 'PC+PO', 'pRNN', 'pRNN+PO','CANN+PO', 'CANN_norecurrence']
@@ -35,9 +35,10 @@ exp:
     random_action_agent: False # If True, overrides all PPO algorithms and chooses actions randomly. Used as control
     curious_agent: False # Use pRNN loss as reward ?
     random_init_control: False # If True, never update parameters i.e. test randomly initalized agent, usually as a control
-    offpolicy_prnn_eval: True # If true, action output is off policy (so if PPO is being done, then actions random. Vice versa if random_action_agent)
+    offpolicy_prnn_eval: False # If true, action output is off policy (so if PPO is being done, then actions random. Vice versa if random_action_agent)
     onpolicy_prnn_eval: False # If True, actions chosen at prnn eval (SI, decoding, etc) are chosen on policy. 
     analyze_agent_behav: False # If true, analyze agent policy (plot policy,state distribution,and more, and calculate mutual info between state and action)
+    exploration: False # If true, the agent explores the environment without receiving any reward, used to only train the pRNN
 
 hardware:
     use_gpu: True
@@ -45,7 +46,7 @@ hardware:
 
 
 rl:
-    steps: 5e5
+    steps: 1e6
     discount: 0.98
     lr: 0.0007
     gae_lambda: 0.95 # Lambda coefficient in GAE formula (1 means no gae)
@@ -64,12 +65,13 @@ rl:
 
 predNet:
     path: example_nets_donut_long_theta/thcycRNN_5win_full-theta-s8 #example_nets_donut_long_prev_action/thRNN_5win_prevAct-PrevAct-s8
-    folder: '/home/mila/a/aleksei.efremov/pRNN-RL/LabNotebook/20250912_LavaCorners_pRNNs/'
+    folder: '/home/mila/a/aleksei.efremov/pRNN-RL/'
     hiddensize: 500
     pRNNtype: thRNN_1win #AutoencoderPred_LN
     action_encoding: SpeedHD #Onehot
     cell: LayerNormRNNCell
     lr: 2e-3
+    bias_lr: 0.2
     bptttrunc: 1e8
     weight_decay: 3e-3
     ntimescale: 2
@@ -78,14 +80,17 @@ predNet:
     noisestd: 0.05
     sparsity: 0.5
     train: False # Train pRNN simultaneously with RL?
-    seqdur: 0 # Only relevant if train is on
+    seqdur: 500 # Only relevant if train is on
+    mask: 0 # Mask top x portion of neurons
+    mask_type: 'SI' # Properties based on which mask is applied: 'SI', 'EV', or 'Dec'
+    mask_bottom: False # Whether to mask bottom x portion of neurons instead of top x
 
 logging:
     video_log_freq: 500 # Number of episodes between video logs (0: no videos)
     log_interval: 1 # Number of updates between two logs
     analysis_interval: 25 # Number of updates between analysis events (0: no analysis)
-    save_interval: 120 # Number of updates between two saves (0: don't save)
-    early_stop: True # Should the training stop when the environment is solved?
+    save_interval: 125 # Number of updates between two saves (0: don't save)
+    early_stop: False # Should the training stop when the environment is solved?
     save_params: True # Should the parameters given to the script be saved? (Always...)
     focus: False #'rl.k_int' # Which parameter to include in the group name or False
     project: test # ['Place field width', 'PO-FO-PC-CANN-comparison']

@@ -1,4 +1,4 @@
-env_key: MiniGrid-Lava-Corners-neg05-v2 # Name of the environment
+env_key: MiniGrid-Lava-Maze-neg05-v1 # Name of the environment
 env_package: farama-minigrid # Environment package
 agent_key: RandomActionAgent # [RandomActionAgent, RatInABoxAgent, MiniworldRandomAgent]
 actenc: SpeedHD # Action encoding method [SpeedHD, ContSpeedOnehotHDRiaB, ContSpeedOnehotHDMiniworld]

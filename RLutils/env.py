@@ -61,7 +61,7 @@ def make_env(
     if vid_n_episodes:
         #env = RecordVideo(env, video_folder=vid_folder, episode_trigger=lambda x: x%vid_n_episodes == 0)
         trigger_func = partial(episode_video_trigger, vid_n_episodes=vid_n_episodes)
-        env = RecordVideo(env, vid_folder=vid_folder, episode_trigger=trigger_func)
+        env = RecordVideo(env, video_folder=vid_folder, episode_trigger=trigger_func)
     
     env.reset(seed=seed)
     env = FaramaMinigridShell(env, act_enc, env_key)

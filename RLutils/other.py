@@ -22,8 +22,6 @@ def synthesize(array, signs=False, abs=False):
     d["min"] = np.nanmin(array)
     d["max"] = np.nanmax(array)
     if signs:
-        valid_idxs = ~np.isnan(array)
-        array = array[valid_idxs]
         array = np.array(array)
         d["pos"] = np.sum(np.sign(array)[array>0])
         d["neg"] = np.sum(np.abs(np.sign(array)[array<0]))
