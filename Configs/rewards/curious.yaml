@@ -1,0 +1,3 @@
+curious_enabled: True
+curious_coef: 1
+exploration: True # agent explores the environment without receiving external rewards

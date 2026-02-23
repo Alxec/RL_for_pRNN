@@ -1,0 +1,4 @@
+spatial: True # This should be always True in this config
+place_cells:
+  pc_sd: 4
+  pc_norm: True

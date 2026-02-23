@@ -4,7 +4,7 @@ import numpy as np
 
 class FakePlaceCells(object):
 
-    def __init__(self, env, size=300, sd=3, seed=42, normalize=True):
+    def __init__(self, env, size=300, sd=3, normalize=True):
         self.env = env.env
         self.size = size
         self.sd = np.tile(sd, (2, size))
@@ -13,7 +13,6 @@ class FakePlaceCells(object):
             self.norm_factor = norm.pdf(0, 0, sd)**2
         else:
             self.norm_factor = 1
-        np.random.seed(seed=seed)
         for i in range(size):
             self.means[:,i] = self.check_position()
         

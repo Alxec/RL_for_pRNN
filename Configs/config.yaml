@@ -1,0 +1,81 @@
+defaults:
+    - rl/ppo # Choose algorithm subconfig
+    - _self_  
+    - override hydra/hydra_logging: disabled  
+    - override hydra/job_logging: disabled
+
+hydra:  
+  output_subdir: null
+  sweep:
+    dir: .
+    subdir: .
+  run:  
+    dir: .
+
+exp:
+    env_name: MiniGrid-DonutLava-Long-neg05-v0 # Name of the environment to train on [MiniGrid-DonutLava-Long-neg05-v2]
+    opt_return: 0.85 # Optimal return for the environment
+    # wrapper: 
+    #   _target_: minigrid.wrappers.RGBImgPartialObsWrapper_HD # Environment wrapper as python class
+    input_type: 'FO' # ['Visual_FO', 'Visual_PO', 'PC', 'CANN', 'PC+PO', 'pRNN', 'pRNN+PO','CANN+PO', 'CANN_norecurrence']
+    exp_name: test
+    seed: 2 # Random seed
+    with_obs: False # Whether to include visual input (in case of recurrency the one that would bypass RNN)
+    with_HD: True
+    rgb: False # Is visual input RGB?
+    random_action_agent: False # If True, overrides all PPO algorithms and chooses actions randomly. Used as control
+    random_init_control: False # If True, never update parameters i.e. test randomly initalized agent, usually as a control
+    offpolicy_prnn_eval: False # If true, action output is off policy (so if PPO is being done, then actions random. Vice versa if random_action_agent)
+    onpolicy_prnn_eval: False # If True, actions chosen at prnn eval (SI, decoding, etc) are chosen on policy. 
+    analyze_agent_behav: False # If true, analyze agent policy (plot policy,state distribution,and more, and calculate mutual info between state and action)
+    steps: 1e6
+
+
+rewards:
+    internal_enabled: False # Use internal rewards?
+    curious_enabled: False # Use pRNN loss as reward?
+    exploration: False # If true, the agent explores the environment without receiving any reward, used to only train the pRNN
+
+
+ppo:
+    discount: 0.98
+    lr: 0.0007
+    gae_lambda: 0.95 # Lambda coefficient in GAE formula (1 means no gae)
+    entropy_coef: 0.01
+    value_loss_coef: 0.5
+    max_grad_norm: 0.5
+    clip_eps: 0.2 # Clipping epsilon for PPO
+    epochs: 4 # Number of epochs for PPO
+    batch_size: 256
+    adam_eps: 1e-8 # Adam and RMSprop optimizer epsilon
+    num_frames: 2048 # Number of frames before update
+    recurrence: 1 # Whether to use RNN for memory (1 = don't use, other number = number of recurrent steps)
+
+
+SR:
+    spatial: False # Whether to use spatial representations as inputs
+    cells: 500
+    action_encoding: SpeedHD 
+    past_SR: True
+    train: False # Train pRNN simultaneously with RL?
+    mask_indices: null
+    predictive_net: null
+    place_cells: null
+    CANN: null
+    
+
+logging:
+    video_log_freq: 500 # Number of episodes between video logs (0: no videos)
+    log_interval: 1 # Number of updates between two logs
+    analysis_interval: 25 # Number of updates between analysis events (0: no analysis)
+    save_interval: 125 # Number of updates between two saves (0: don't save)
+    early_stop: False # Should the training stop when the environment is solved?
+    save_params: True # Should the parameters given to the script be saved? (Always...)
+    focus: False #'rl.k_int' # Which parameter to include in the group name or False
+    project: test # ['Place field width', 'PO-FO-PC-CANN-comparison']
+    logdir: "/network/scratch/a/aleksei.efremov/RLstorage"
+    load_acmodel: False #'/network/scratch/a/aleksei.efremov/RLstorage/Donut_long_neg05_shortbptt/PO+Rec_seed10_24-01-22-15-46-34' # False or the path to the model
+
+hardware:
+    use_gpu: True
+    which_gpu: 0 # GPU device code, not used now

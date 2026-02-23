@@ -22,7 +22,7 @@ class PredictivePPOAlgo:
     def __init__(self, env, acmodel, predictiveNet=None, device=None, num_frames=None, discount=0.99, lr=0.001,
                  gae_lambda=0.95, entropy_coef=0.01, value_loss_coef=0.5, max_grad_norm=0.5, recurrence=1,
                  adam_eps=1e-8, clip_eps=0.2, epochs=4, batch_size=256, preprocess_obss=None, place_cells=None,
-                 cann=None, train_pN=False, noise_mu=0, noise_std=0.03, prnn_seqdur=0, intrinsic=False, k_int=1,
+                 cann=None, train_pN=False, prnn_seqdur=0, intrinsic=False, k_int=1,
                  pastSR=False, curious_agent=False, k_curious=1, exploration=False, mask_indices=None):
         """
         Initializes a `BaseAlgo` instance.
@@ -61,30 +61,42 @@ class PredictivePPOAlgo:
         print('Store parameters')
         self.env = env
         self.acmodel = acmodel
-        self.pN = predictiveNet
         self.device = device
-        self.num_frames = num_frames or 128
+        self.preprocess_obss = preprocess_obss or default_preprocess_obss
+
         self.discount = discount
         self.lr = lr
         self.gae_lambda = gae_lambda
         self.entropy_coef = entropy_coef
         self.value_loss_coef = value_loss_coef
         self.max_grad_norm = max_grad_norm
+        self.clip_eps = clip_eps
+        self.epochs = epochs
+        self.batch_size = batch_size
+        self.num_frames = num_frames or 128
         self.recurrence = recurrence
-        self.preprocess_obss = preprocess_obss or default_preprocess_obss
-        self.intrinsic = intrinsic
-        self.k_int = k_int
+
+        self.pN = predictiveNet
         self.PC = place_cells
         self.CANN = cann
-        self.train_pN = train_pN
-        self.noise_mu = noise_mu
-        self.noise_std = noise_std
-        self.prnn_seqdur = prnn_seqdur
         self.pastSR = pastSR
+        self.mask_indices = mask_indices
+
+        self.intrinsic = intrinsic
+        self.k_int = k_int
         self.curious_agent = curious_agent
         self.k_curious = k_curious
+
+        self.train_pN = train_pN
+        self.prnn_seqdur = prnn_seqdur
         self.exploration = exploration
-        self.mask_indices = mask_indices
+        
+
+        # Control parameters
+        print('Control parameters')
+        assert self.acmodel.recurrent or self.recurrence == 1
+        assert self.num_frames % self.recurrence == 0
+        assert self.batch_size % self.recurrence == 0
         assert pastSR ^ ('Next' in str(env.encodeAction))
 
         if hasattr(self.env, 'loc_mask'):
@@ -93,17 +105,11 @@ class PredictivePPOAlgo:
             self.loc_mask = [x==None or x.can_overlap() for x in env.env.grid.grid]
         else:
             self.loc_mask = [x==None or x.can_overlap() for x in env.grid.grid]
-
-        if self.pN and 'thcyc' in str(self.pN.pRNN):
-            self.theta = True
-            self.k = self.pN.pRNN.k + 1
-        else:
-            self.theta = False
-
-        # Control parameters
-        print('Control parameters')
-        assert self.acmodel.recurrent or self.recurrence == 1
-        assert self.num_frames % self.recurrence == 0
+            
+        self.obs = self.env.reset()
+        self.loc = self.agent_pos()
+        self.mask = 1
+        print('Reset done')
 
         # Configure models
         print('Configure acmodel')
@@ -113,10 +119,12 @@ class PredictivePPOAlgo:
         # TODO: should be elsewhere if saving the net
             self.pN.pRNN.to(self.device)
 
-        self.obs = self.env.reset()
-        self.loc = self.agent_pos()
-        self.mask = 1
-        print('Reset done')
+        if self.pN and 'thcyc' in str(self.pN.pRNN):
+            self.theta = True
+            self.k = self.pN.pRNN.k + 1
+        else:
+            self.theta = False
+
 
         # Initialize spatial representations (if used)
         self.init_SR()
@@ -132,12 +140,6 @@ class PredictivePPOAlgo:
             self.ref = torch.zeros((1,self.SR.shape[-1]), device=self.device)
             self.nrefs = 0
             self.int_rewards = torch.zeros(self.num_frames, device=self.device)
-
-        self.clip_eps = clip_eps
-        self.epochs = epochs
-        self.batch_size = batch_size
-
-        assert self.batch_size % self.recurrence == 0
 
         self.optimizer = torch.optim.Adam(self.acmodel.parameters(), lr, eps=adam_eps)
         self.batch_num = 0

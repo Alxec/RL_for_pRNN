@@ -32,6 +32,7 @@ def episode_video_trigger(episode, vid_n_episodes):
 def make_env(
              env_key,
              input_type,
+             spatial_config,
              seed=0,
              vid_folder='',
              vid_n_episodes=0,
@@ -46,7 +47,7 @@ def make_env(
         # Not RGB one here because we want RL agent to have as much info as possible
         env = FullyObsWrapper(env)
 
-    elif 'pRNN' in input_type or 'PO' in input_type:
+    elif spatial_config.predictive_net or 'PO' in input_type:
         # The same RGB wrapper is used for comparability whenever partial observation is needed
         env = RGBImgPartialObsWrapper_HD(env, tile_size=1)
     
