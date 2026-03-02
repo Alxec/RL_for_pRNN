@@ -8,6 +8,7 @@ RLvideos/*
 *.pyc
 *.ipynb
 test*
+migrate*
 
 trainRL.py
 train_RL.py

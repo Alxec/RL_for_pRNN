@@ -14,7 +14,7 @@ hydra:
 
 exp:
     env_name: MiniGrid-DonutLava-Long-neg05-v0 # Name of the environment to train on [MiniGrid-DonutLava-Long-neg05-v2]
-    opt_return: 0.85 # Optimal return for the environment
+    opt_return: 0.9 # Optimal return for the environment
     # wrapper: 
     #   _target_: minigrid.wrappers.RGBImgPartialObsWrapper_HD # Environment wrapper as python class
     input_type: 'FO' # ['Visual_FO', 'Visual_PO', 'PC', 'CANN', 'PC+PO', 'pRNN', 'pRNN+PO','CANN+PO', 'CANN_norecurrence']
@@ -23,6 +23,9 @@ exp:
     with_obs: False # Whether to include visual input (in case of recurrency the one that would bypass RNN)
     with_HD: True
     rgb: False # Is visual input RGB?
+    goal_conditioned: False # Whether to condition the policy on the goal
+    goal_threshold: 0.1 # Threshold for considering a goal achieved (in terms of cosine similarity between current and goal state)
+    check_location: False # Whether to check goal achievement based on location (exact match) instead of internal strategy
     random_action_agent: False # If True, overrides all PPO algorithms and chooses actions randomly. Used as control
     random_init_control: False # If True, never update parameters i.e. test randomly initalized agent, usually as a control
     offpolicy_prnn_eval: False # If true, action output is off policy (so if PPO is being done, then actions random. Vice versa if random_action_agent)
@@ -50,6 +53,8 @@ ppo:
     adam_eps: 1e-8 # Adam and RMSprop optimizer epsilon
     num_frames: 2048 # Number of frames before update
     recurrence: 1 # Whether to use RNN for memory (1 = don't use, other number = number of recurrent steps)
+    prior_kl_coef: 0.0 # Coefficient for KL divergence penalty toward policy prior (0 = disabled)
+    policy_prior: null # Prior action probabilities e.g. [0.15, 0.15, 0.6, 0.1]; must sum to 1
 
 
 SR:
@@ -59,6 +64,7 @@ SR:
     past_SR: True
     train: False # Train pRNN simultaneously with RL?
     mask_indices: null
+    mask_internal: False # Whether to mask only for internal rewards (True) or SR inputs as well (False)
     predictive_net: null
     place_cells: null
     CANN: null
@@ -68,6 +74,7 @@ logging:
     video_log_freq: 500 # Number of episodes between video logs (0: no videos)
     log_interval: 1 # Number of updates between two logs
     analysis_interval: 25 # Number of updates between analysis events (0: no analysis)
+    initial_analysis_step: 0 # Initially, analysis is done at every step, but after this number of steps, it is done every 'analysis_interval' steps
     save_interval: 125 # Number of updates between two saves (0: don't save)
     early_stop: False # Should the training stop when the environment is solved?
     save_params: True # Should the parameters given to the script be saved? (Always...)

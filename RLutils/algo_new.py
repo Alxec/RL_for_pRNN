@@ -8,11 +8,17 @@ import torch
 import numpy as np
 from scipy.stats import entropy
 from scipy.spatial.distance import cosine
+from torch.distributions import Categorical, kl_divergence
 from torch_ac.format import default_preprocess_obss
 from torch_ac.utils import DictList
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 
-from .reward_strategies import InternalRewardStrategy, CuriousRewardStrategy
+from .reward_strategies import (
+    InternalRewardStrategy,
+    CuriousRewardStrategy,
+    GoalSelectionStrategy,
+    RandomGoalStrategy,
+)
 from .spatial_strategies import create_spatial_representation_strategy
 from .other import synthesize
 from .analysis import mutual_info_policy
@@ -36,6 +42,7 @@ class StepData:
     log_prob: torch.Tensor
     loc: Tuple[int, int]
     mask: float
+    reward_past: Optional[float] = None  # reward credited to the *previous* step
 
 
 class ExperienceBuffer:
@@ -72,8 +79,8 @@ class ExperienceBuffer:
         self.values[idx] = step_data.value
         self.rewards[idx] = step_data.reward
         self.log_probs[idx] = step_data.log_prob
-        # if step_data.reward_past is not None:
-        #     self.rewards[idx-1] += step_data.reward_past
+        if step_data.reward_past is not None and idx > 0:
+            self.rewards[idx - 1] += step_data.reward_past
 
     def store_rewards(self, name: str, rewards: torch.Tensor):
         """Store additional reward signals."""
@@ -150,9 +157,11 @@ class MetricsTracker:
         self.loc_visits = np.zeros([env.width, env.height])
         self.loc_history = [np.zeros(np.sum(loc_mask))] * 5
     
-    def update_step(self, reward: float):
+    def update_step(self, reward: float, past_reward: Optional[float] = None):
         """Update metrics for a single step."""
         self.episode_return += reward
+        if past_reward is not None:
+            self.episode_return += past_reward
         self.episode_num_frames += 1
     
     def update_location_visit(self, loc: Tuple[int, int]):
@@ -260,6 +269,9 @@ class PredictivePPOAlgo:
         self._setup_metrics()
         self._setup_optimizer()
         
+        # Policy prior
+        self._setup_policy_prior()
+        
         # Training state
         self.batch_num = 0
         
@@ -323,6 +335,7 @@ class PredictivePPOAlgo:
         
         # Internal rewards
         if self.reward_config.internal_enabled:
+            
             SR_size = self.SR_strategy.get_SR_size(self.SR)
             self.internal_strategy = InternalRewardStrategy(
                 k_int=self.reward_config.internal_coef,
@@ -362,6 +375,23 @@ class PredictivePPOAlgo:
         """Initialize metrics tracker."""
         self.metrics = MetricsTracker(self.env, self.loc_mask)
     
+    def _setup_policy_prior(self):
+        """Setup policy prior tensor if configured."""
+        prior = getattr(self.config, 'policy_prior', None)
+        kl_coef = getattr(self.config, 'prior_kl_coef', 0.0)
+        
+        if prior is not None and kl_coef > 0.0:
+            # Accept list/ListConfig/tensor
+            prior_list = OmegaConf.to_container(prior) if hasattr(prior, '_metadata') else list(prior)
+            prior_tensor = torch.tensor(prior_list, dtype=torch.float32, device=self.device)
+            prior_tensor = prior_tensor / prior_tensor.sum()  # normalise defensively
+            self.policy_prior = prior_tensor
+            logger.info(f"Policy prior enabled: {prior_list}, kl_coef={kl_coef}")
+        else:
+            self.policy_prior = None
+        
+        self.prior_kl_coef = kl_coef
+
     def _setup_optimizer(self):
         """Initialize optimizer."""
         self.optimizer = torch.optim.Adam(
@@ -426,9 +456,6 @@ class PredictivePPOAlgo:
             past_obs=self.obs,
             new_obs=new_obs
             )
-
-        # reward_new, reward_past, done = self.SR_strategy.check_goal(SR_new, SR_ref)
-        # reward += reward_new
         
         # Create step data
         step_data = StepData(
@@ -441,7 +468,6 @@ class PredictivePPOAlgo:
             log_prob=dist.log_prob(action),
             loc=self.loc,
             mask=self.mask,
-            # reward_past=reward_past
         )
         
         # Update state
@@ -558,6 +584,7 @@ class PredictivePPOAlgo:
         logger.debug("Starting experience collection")
         
         # Collect experiences
+        any_done = False
         for i in range(self.config.num_frames):
             # Collect single step
             step_data, done = self._collect_single_step(i)
@@ -566,20 +593,23 @@ class PredictivePPOAlgo:
             self.experience_buffer.store_step(i, step_data)
             
             # Update metrics
-            self.metrics.update_step(step_data.reward)
+            self.metrics.update_step(step_data.reward, step_data.reward_past)
             self.metrics.update_location_visit(step_data.loc)
             
             # Handle episode end
             if done:
+                any_done = True
                 self._handle_episode_end(i)
+        
+        # If no episode ended, count the last frame as done
+        if not any_done:
+            self._handle_episode_end(self.config.num_frames - 1)
         
         # Compute augmented rewards
         self._compute_augmented_rewards()
         
         # Compute advantages
-        preprocessed_obs = self.preprocess_obss([self.obs], device=self.device)
-        with torch.no_grad():
-            _, next_value = self.acmodel(preprocessed_obs, SR=self.SR)
+        _, _, next_value, _ = self._select_action()
         
         self.experience_buffer.compute_advantages(
             discount=self.config.discount,
@@ -655,17 +685,27 @@ class PredictivePPOAlgo:
         surr2 = (value_clipped - sb.returnn).pow(2)
         value_loss = torch.max(surr1, surr2).mean()
         
+        # KL divergence from policy prior
+        if self.policy_prior is not None:
+            prior_expanded = self.policy_prior.unsqueeze(0).expand(dist.probs.shape[0], -1)
+            prior_dist = Categorical(probs=prior_expanded)
+            prior_kl = kl_divergence(dist, prior_dist).mean()
+        else:
+            prior_kl = torch.tensor(0.0, device=self.device)
+        
         # Total loss
         loss = (policy_loss - 
                 self.config.entropy_coef * policy_entropy + 
-                self.config.value_loss_coef * value_loss)
+                self.config.value_loss_coef * value_loss +
+                self.prior_kl_coef * prior_kl)
         
         # Metrics
         metrics = {
             'entropy': policy_entropy.item() / torch.log(torch.tensor(2.0)),  # nats to bits
             'value': value.mean().item(),
             'policy_loss': policy_loss.item(),
-            'value_loss': value_loss.item()
+            'value_loss': value_loss.item(),
+            'prior_kl': prior_kl.item()
         }
         
         return loss, metrics
@@ -749,6 +789,7 @@ class PredictivePPOAlgo:
             'value': [],
             'policy_loss': [],
             'value_loss': [],
+            'prior_kl': [],
             'grad_norm': []
         }
         
@@ -856,7 +897,7 @@ class PredictivePPOAlgo:
                 processed[key] = logs_collect[key]
         
         # Add metrics from update_parameters
-        for key in ["entropy", "policy_loss", "value_loss", "grad_norm"]:
+        for key in ["entropy", "policy_loss", "value_loss", "prior_kl", "grad_norm"]:
             if key in logs_update:
                 processed[key] = logs_update[key]
         
@@ -926,3 +967,248 @@ class PredictivePPOAlgo:
                 "entropy": policy_entropy,
                 "loc_entropy": loc_entropy,
                 "loc_entropy_5": loc_entropy_5}
+
+
+# ============================================================================
+# Goal-Conditioned PPO
+# ============================================================================
+
+class GoalConditionedPPOAlgo(PredictivePPOAlgo):
+    """
+    Goal-conditioned extension of PredictivePPOAlgo.
+
+    At the start of every ``collect_experiences`` call a goal SR is drawn from
+    *goal_pool* via *goal_strategy* (defaults to :class:`RandomGoalStrategy`).
+    The same goal is re-drawn after each episode ends within the rollout.
+
+    The goal SR is:
+    * Set as the reference of the ``InternalRewardStrategy`` so that
+      distance-based internal rewards track progress toward the goal.
+    * Concatenated to the current SR and passed to ``ACModelSR`` as its ``SR``
+      argument.  The model must therefore be constructed with
+      ``SR_size = raw_SR_size + goal_SR_size``.
+
+    A terminal bonus reward is issued when the agent's new SR is closer than
+    *goal_threshold* (cosine distance) to the goal:
+    * ``past_SR=False`` -> +1 added to the **current** step's reward.
+    * ``past_SR=True``  -> +1 added to the **previous** step's reward.
+    """
+
+    def __init__(
+        self,
+        env,
+        acmodel: torch.nn.Module,
+        predictiveNet: Any,
+        ppo_config: DictConfig,
+        spatial_config: DictConfig,
+        reward_config: DictConfig,
+        goal_pool: torch.Tensor,
+        goal_threshold: float,
+        goal_strategy: Optional[GoalSelectionStrategy] = None,
+        check_location: bool = False,
+        device: Optional[torch.device] = None,
+        preprocess_obss=None,
+    ):
+        """
+        Args:
+            goal_pool:       Tensor of candidate goal SRs  [n_goals, SR_dim].
+            goal_threshold:  Cosine-distance threshold for reaching a goal.
+            goal_strategy:   How to pick a goal from the pool.
+                             Defaults to :class:`RandomGoalStrategy`.
+            (other args):    Forwarded to :class:`PredictivePPOAlgo`.
+        """
+        # Store goal pool early so _setup_experience_buffer can use it.
+        # device is resolved inside super().__init__; store raw tensor for now.
+        self._goal_pool_raw = goal_pool['h']
+        self._goal_locs = goal_pool['state']['agent_pos']
+        self.goal_threshold = goal_threshold
+        self.goal_strategy = goal_strategy or RandomGoalStrategy()
+        self.check_location = check_location
+
+        super().__init__(
+            env, acmodel, predictiveNet,
+            ppo_config, spatial_config, reward_config,
+            device=device, preprocess_obss=preprocess_obss,
+        )
+
+        # Move pool to the resolved device and re-init experience buffer at the
+        # correct (doubled) SR size.
+        self.goal_pool = self._goal_pool_raw.to(self.device)
+
+        raw_SR_size = self.SR_strategy.get_SR_size(self.SR)
+        self.experience_buffer = ExperienceBuffer(
+            num_frames=self.config.num_frames,
+            SR_size=raw_SR_size * 2,
+            device=self.device,
+        )
+
+        # InternalRewardStrategy is required for goal-reaching checks.
+        assert self.internal_strategy is not None, (
+            "GoalConditionedPPOAlgo requires reward_config.internal_enabled=True"
+        )
+
+        # Select and apply the first goal.
+        self.goal = self._select_goal()
+        self.internal_strategy.set_reference(self.goal)
+        logger.info("GoalConditionedPPOAlgo initialised")
+
+    # ------------------------------------------------------------------
+    # Goal management
+    # ------------------------------------------------------------------
+
+    def _select_goal(self) -> torch.Tensor:
+        """Draw a new goal from the pool using the configured strategy."""
+        self.goal, idx = self.goal_strategy.select_goal(self.goal_pool)
+        self.goal_loc = self._goal_locs[idx]
+
+    def _set_new_goal(self) -> None:
+        """Select a new goal from the pool and update the internal strategy."""
+        self._select_goal()
+        self.internal_strategy.set_reference(self.goal)
+        logger.debug("New goal selected")
+
+    def _check_goal(self, loc) -> Tuple[float, bool]:
+        if (loc == self.goal_loc).all():
+            return 1.0, True
+        else:
+            return 0.0, False
+
+    # ------------------------------------------------------------------
+    # Overrides
+    # ------------------------------------------------------------------
+
+    def _select_action(self) -> Tuple[torch.Tensor, Any, torch.Tensor, np.ndarray]:
+        """Select action using goal-conditioned SR (current SR ‖ goal)."""
+        preprocessed_obs = self.preprocess_obss([self.obs], device=self.device)
+        goal_conditioned_SR = torch.cat([self.SR, self.goal], dim=1)
+
+        with torch.no_grad():
+            dist, value = self.acmodel(preprocessed_obs, SR=goal_conditioned_SR)
+
+        action = dist.sample()
+        det_action = action.cpu().numpy()
+        return action, dist, value, det_action
+
+    def _collect_single_step(self, idx: int) -> Tuple[StepData, bool]:
+        """
+        Collect one step.  Checks for goal reaching and issues a terminal
+        bonus reward when the cosine distance between the new SR and the goal
+        drops below *goal_threshold*.
+        """
+        action, dist, value, det_action = self._select_action()
+
+        new_obs, reward, terminated, truncated, _ = self.env.step(det_action)
+
+        if self.reward_config.exploration:
+            reward, terminated, truncated = 0, False, False
+
+        done = terminated or truncated
+        done = done or (
+            self.reward_config.exploration
+            and (idx + 1) % self.spatial_config.predictive_net.seqdur == 0
+        )
+
+        new_loc = self._get_agent_pos()
+
+        SR_new = self.SR_strategy.compute_SR(
+            action=det_action,
+            past_obs=self.obs,
+            new_obs=new_obs,
+        )
+
+        # --- Goal-reaching check -----------------------------------------
+        if self.check_location:
+            reward_new, goal_reached = self._check_goal(new_loc)
+            reward_past = None  # not used when check_location is True
+        else:
+            reward_new, reward_past, goal_reached = self.internal_strategy.check_goal(
+                SR_new=SR_new,
+                goal_threshold=self.goal_threshold,
+                past_SR=self.spatial_config.past_SR,
+            )
+        reward += reward_new
+        done = done or goal_reached
+
+        # Store goal-conditioned SR so training uses the same representation
+        # that was used for action selection.
+        goal_conditioned_SR = torch.cat([self.SR, self.goal], dim=1)
+
+        step_data = StepData(
+            obs=self.obs,
+            action=action,
+            reward=reward,
+            value=value,
+            SR=goal_conditioned_SR,
+            dist=dist,
+            log_prob=dist.log_prob(action),
+            loc=self.loc,
+            mask=self.mask,
+            reward_past=reward_past,
+        )
+
+        # Update state
+        self.obs = new_obs
+        self.loc = new_loc
+        self.SR = SR_new          # always store *raw* SR; goal is kept separately
+        self.mask = 1 - done
+
+        return step_data, done
+
+    def _handle_episode_end(self, idx: int) -> None:
+        """Handle episode end AND select a fresh goal for the next episode."""
+        super()._handle_episode_end(idx)
+        self._set_new_goal()
+
+    def collect_experiences(self) -> DictList:
+        """
+        Collect rollouts.
+
+        Selects a fresh goal at the very start of the collection window so
+        that the first episode always has a well-defined goal even when the
+        collector is called for the first time.
+        """
+        self._set_new_goal()
+        return super().collect_experiences()
+
+    def _compute_augmented_rewards(self) -> None:
+        """
+        Compute augmented rewards.
+
+        The experience buffer stores goal-conditioned SRs
+        (shape ``[num_frames, raw_SR_size + goal_SR_size]``).
+        The internal strategy operates on *raw* SRs only, so we strip the
+        goal suffix before calling ``compute_rewards``.
+        """
+        # --- Internal (proximity) rewards --------------------------------
+        if self.internal_strategy:
+            raw_sr_size = self.SR.shape[1]          # self.SR is always the raw SR
+
+            if self.spatial_config.past_SR:
+                _, _, _, det_action = self._select_action()
+                SR_last = self.SR_strategy.last_SR(
+                    SR=self.SR,
+                    det_action=det_action,
+                    obs=self.obs,
+                )
+                raw_SRs = torch.cat(
+                    (self.experience_buffer.SRs[1:, :raw_sr_size], SR_last), dim=0
+                )
+            else:
+                raw_SRs = self.experience_buffer.SRs[:, :raw_sr_size]
+
+            internal_rewards = self.internal_strategy.compute_rewards(SRs=raw_SRs)
+            self.experience_buffer.store_rewards("internal", internal_rewards)
+
+        # --- Curious rewards (unchanged from base class) -----------------
+        if self.curious_strategy:
+            actions_np = self.experience_buffer.actions.cpu().numpy()
+            obss_all = self.experience_buffer.obss + [self.obs]
+            curious_rewards = self.curious_strategy.compute_rewards(
+                obss=obss_all,
+                actions=actions_np,
+                num_frames=self.config.num_frames,
+                done_indices=self.experience_buffer.done_indices,
+                last_observations=self.experience_buffer.last_observations,
+                last_actions=self.experience_buffer.last_actions,
+            )
+            self.experience_buffer.store_rewards("curious", curious_rewards)

@@ -1,0 +1,6 @@
+input_type: 'SR'
+exp_name: Masked_5
+goal_conditioned: True # Whether to condition the policy on the goal
+goal_threshold: 0.1 # Threshold for considering a goal achieved (in terms of cosine similarity between current and goal state)
+check_location: True # Whether to check goal achievement based on location (exact match) instead of internal strategy
+steps: 5e6

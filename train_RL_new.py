@@ -14,11 +14,11 @@ import RLutils
 from RLutils.other import device
 from RLutils.model import ACModel, RecACModel, ACModelSR, ACModelTheta, ACModelThetaShared, ACModelThetaSingle
 from RLutils.agent import ActorCriticAgent
-from RLutils.algo_new import PredictivePPOAlgo
+from RLutils.algo_new import PredictivePPOAlgo, GoalConditionedPPOAlgo
 from RLutils.analysis_new import EnvironmentFeaturesAnalysis, OnPolicyAnalysis
 from prnn.utils.predictiveNet import PredictiveNet
 from prnn.utils.thetaRNN import LayerNormRNNCell, RNNCell
-from prnn.utils.agent import RandomActionAgent
+from prnn.utils.agent import create_agent
 
 RNNoptions = {'LayerNormRNNCell' : LayerNormRNNCell ,
               'RNNCell' : RNNCell
@@ -133,8 +133,9 @@ class RL_Trainer(object):
         print(f"Device: {device}\n")
 
         # Load environment
+        env_key = args.exp.env_name
         env = RLutils.make_env(
-                               env_key=args.exp.env_name,
+                               env_key=env_key,
                                input_type=args.exp.input_type,
                                spatial_config=args.SR,
                                seed=args.exp.seed + 10000,
@@ -143,6 +144,11 @@ class RL_Trainer(object):
                                act_enc = args.SR.action_encoding
                                 )
         print("Environment loaded\n")
+
+
+        # Create random agent for analysis and goals-generation
+        randomagent = create_agent(envname=env_key, env=env,
+                                   agentkey='RandomActionAgent')
 
         # Load training status
 
@@ -168,8 +174,12 @@ class RL_Trainer(object):
             
         prnn_eval_bool = args.exp.offpolicy_prnn_eval or args.exp.onpolicy_prnn_eval
 
-        # Load models            
-        if args.SR.spatial:
+        # Load models
+        if args.exp.goal_conditioned:
+            acmodel = ACModelSR(obs_space, env.action_space,
+                                args.SR.cells*2, args.exp.with_obs,
+                                args.exp.rgb, args.exp.with_HD)
+        elif args.SR.spatial:
             acmodel = ACModelSR(obs_space, env.action_space,
                                 args.SR.cells, args.exp.with_obs,
                                 args.exp.rgb, args.exp.with_HD)
@@ -185,28 +195,40 @@ class RL_Trainer(object):
         print("AC model loaded\n")
 
         # Load algo
-        args.SR.past_SR = predictiveNet==None or not('prevAct' in str(predictiveNet.pRNN))
-        algo = PredictivePPOAlgo(
-            env=env,
-            acmodel=acmodel,
-            predictiveNet=predictiveNet,
-            device=device,
-            preprocess_obss=preprocess_obss,
-            ppo_config=args.ppo,
-            spatial_config=args.SR,
-            reward_config=args.rewards,
-            )
+        if args.exp.goal_conditioned:
+            EFS = EnvironmentFeaturesAnalysis(env, randomagent,
+                                              prnn_model=predictiveNet,
+                                              timesteps=15000)
+            goal_pool = EFS.data
+            algo = GoalConditionedPPOAlgo(
+                env=env,
+                acmodel=acmodel,
+                predictiveNet=predictiveNet,
+                device=device,
+                preprocess_obss=preprocess_obss,
+                ppo_config=args.ppo,
+                spatial_config=args.SR,
+                reward_config=args.rewards,
+                goal_pool=goal_pool,
+                goal_threshold=args.exp.goal_threshold,
+                check_location=args.exp.check_location
+                )
+        else:
+            algo = PredictivePPOAlgo(
+                env=env,
+                acmodel=acmodel,
+                predictiveNet=predictiveNet,
+                device=device,
+                preprocess_obss=preprocess_obss,
+                ppo_config=args.ppo,
+                spatial_config=args.SR,
+                reward_config=args.rewards,
+                )
 
 
         if "optimizer_state" in status:
             algo.optimizer.load_state_dict(status["optimizer_state"])
         print("Optimizer loaded\n")
-
-
-        # Create random agent for analysis
-
-        action_probability = np.array([0.15,0.15,0.6,0.1])
-        randomagent = RandomActionAgent(env.action_space, action_probability)
 
         # Train model
 
@@ -253,7 +275,9 @@ class RL_Trainer(object):
 
             # Do analysis
 
-            if args.logging.analysis_interval > 0 and update % args.logging.analysis_interval == 0:
+            if (update < args.logging.initial_analysis_step or 
+                (args.logging.analysis_interval > 0 and 
+                 update % args.logging.analysis_interval == 0)):
                 print('Starting analysis at step {}'.format(update))
                 EFS = EnvironmentFeaturesAnalysis(env, randomagent, acmodel, predictiveNet, 20000)
                 if args.rewards.internal_enabled and not error_map:

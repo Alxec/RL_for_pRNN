@@ -1,0 +1,2 @@
+prior_kl_coef: 0.1 # Coefficient for KL divergence penalty toward policy prior (0 = disabled)
+policy_prior: [0.15, 0.15, 0.6, 0.1] # Prior action probabilities e.g. [0.15, 0.15, 0.6, 0.1]; must sum to 1

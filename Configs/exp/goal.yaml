@@ -1,0 +1,5 @@
+input_type: 'SR'
+exp_name: Masked_5
+goal_conditioned: True # Whether to condition the policy on the goal
+goal_threshold: 0.15 # Threshold for considering a goal achieved (in terms of cosine similarity between current and goal state)
+steps: 10e6

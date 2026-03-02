@@ -1,4 +1,4 @@
 curious_enabled: True
 curious_coef: 1
-next_obs: False # whether to use next obs for prediction error (instead of current obs)
+next_obs: True # whether to use next obs for prediction error (instead of current obs)
 exploration: True # agent explores the environment without receiving external rewards

@@ -4,7 +4,7 @@ predictive_net:
     load: True
     path: example_nets_donut_long_theta/thcycRNN_5win_full-theta-s8 #example_nets_donut_long_prev_action/thRNN_5win_prevAct-PrevAct-s8
     folder: '/home/mila/a/aleksei.efremov/pRNN-RL/'
-    pRNNtype: thRNN_1win #AutoencoderPred_LN
+    pRNNtype: thRNN_5win #AutoencoderPred_LN
     cell: LayerNormRNNCell
     lr: 2e-3
     bias_lr: 0.2

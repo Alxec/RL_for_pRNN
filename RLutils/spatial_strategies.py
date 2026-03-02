@@ -162,10 +162,10 @@ class ThetaCyclePredictiveNetworkSR(SpatialRepresentationStrategy):
     
     def compute_SR(self, action: np.ndarray, obs: Dict) -> torch.Tensor:
         """Compute SR using theta cycle predictive network."""
+        # Observations are expected by the pRNN, but to make a prediction, only the first one is needed, the rest are placeholders.
         obs_list = [obs] * (self.theta_k + 1)
-        act_repeated = action.repeat(self.theta_k)
         
-        obs_pN, act_pN = self.pN.env_shell.env2pred(obs_list, act_repeated)
+        obs_pN, act_pN = self.pN.env_shell.env2pred(obs_list, action)
         obs_pN = obs_pN.to(self.device)
         act_pN = act_pN.to(self.device)
         
@@ -260,27 +260,32 @@ def create_spatial_representation_strategy(
     if config.predictive_net is not None:
         if config.train:
             assert config.predictive_net.seqdur > 0, "Set an appropriate seqdur"
+        # Check if masking is only for internal rewards
+        if config.mask_internal:
+            mask_indices = np.array([])
+        else:
+            mask_indices = config.mask_indices        
         # Check for theta cycle mode
         if 'thcyc' in str(predictiveNet.pRNN):
             logger.info("Using ThetaCyclePredictiveNetworkSR")
             return ThetaCyclePredictiveNetworkSR(
                 predictiveNet, 
                 device, 
-                config.mask_indices
+                mask_indices
             )
         elif config.past_SR:
             logger.info("Using PastSR PredictiveNetworkSR")
             return PredictiveNetworkPastSR(
                 predictiveNet, 
                 device,
-                mask_indices=config.mask_indices
+                mask_indices=mask_indices
             )
         else:
             logger.info("Using PredictiveNetworkSR")
             return PredictiveNetworkSR(
                 predictiveNet, 
                 device, 
-                config.mask_indices
+                mask_indices=mask_indices
             )
     elif config.place_cells is not None:
         logger.info("Using PlaceCellsSR")
@@ -292,7 +297,7 @@ def create_spatial_representation_strategy(
         return PlaceCellsSR(
             PC, 
             device, 
-            config.mask_indices,
+            mask_indices,
             config.past_SR
         )
     elif config.CANN is not None:
