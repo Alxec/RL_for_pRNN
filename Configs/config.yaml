@@ -38,7 +38,10 @@ exp:
 
 rewards:
     internal_enabled: False # Use internal rewards?
+    internal_coef: 1
     curious_enabled: False # Use pRNN loss as reward?
+    curious_coef: 1
+    next_obs: True # whether to use next obs for prediction error (instead of current obs)
     exploration: False # If true, the agent explores the environment without receiving any reward, used to only train the pRNN
 
 
