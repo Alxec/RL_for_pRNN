@@ -2,5 +2,14 @@ input_type: 'SR'
 exp_name: Masked_5
 goal_conditioned: True # Whether to condition the policy on the goal
 goal_threshold: 0.1 # Threshold for considering a goal achieved (in terms of cosine similarity between current and goal state)
-check_location: True # Whether to check goal achievement based on location (exact match) instead of internal strategy
-steps: 5e6
+check_location: True # Whether to check goal achievement based on location (exact match) instead of internal representation
+exclude_goals: False
+x_min: 5 # Minimum x-coordinate of the area to exclude from goal sampling
+x_max: 11 # Maximum x-coordinate of the area to exclude from goal sampling
+y_min: 10 # Minimum y-coordinate of the area to exclude from goal sampling
+y_max: 16 # Maximum y-coordinate of the area to exclude from goal sampling
+x_min_val: 5 # Minimum x-coordinate of the area to exclude from goal sampling
+x_max_val: 11 # Maximum x-coordinate of the area to exclude from goal sampling
+y_min_val: 10 # Minimum y-coordinate of the area to exclude from goal sampling
+y_max_val: 16 # Maximum y-coordinate of the area to exclude from goal sampling
+steps: 8e6

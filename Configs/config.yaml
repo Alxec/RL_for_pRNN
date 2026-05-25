@@ -14,10 +14,12 @@ hydra:
 
 exp:
     env_name: MiniGrid-DonutLava-Long-neg05-v0 # Name of the environment to train on [MiniGrid-DonutLava-Long-neg05-v2]
+    env_goal: null
+    env_val: null
     opt_return: 0.9 # Optimal return for the environment
     # wrapper: 
     #   _target_: minigrid.wrappers.RGBImgPartialObsWrapper_HD # Environment wrapper as python class
-    input_type: 'FO' # ['Visual_FO', 'Visual_PO', 'PC', 'CANN', 'PC+PO', 'pRNN', 'pRNN+PO','CANN+PO', 'CANN_norecurrence']
+    input_type: '' # ['Visual_FO', 'Visual_PO', 'PC', 'CANN', 'PC+PO', 'pRNN', 'pRNN+PO','CANN+PO', 'CANN_norecurrence']
     exp_name: test
     seed: 2 # Random seed
     with_obs: False # Whether to include visual input (in case of recurrency the one that would bypass RNN)

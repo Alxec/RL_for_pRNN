@@ -5,7 +5,7 @@ from gymnasium.wrappers import RecordVideo
 from minigrid.wrappers import *
 from functools import partial
 
-# import prnn.environments.Lroom
+import prnn.environments.Lroom
 from prnn.utils.CANNNet import CANNnet
 from prnn.utils.Shell import FaramaMinigridShell
 

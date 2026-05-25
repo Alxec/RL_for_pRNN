@@ -1,4 +1,4 @@
 input_type: 'Visual_PO'
 exp_name: PO
-with_HD: True
+with_obs: True # Whether to include visual input (in case of recurrency the one that would bypass RNN)
 rgb: True # Is visual input RGB?

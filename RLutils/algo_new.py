@@ -1,5 +1,6 @@
 import logging
 import math
+import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Tuple, Any
@@ -22,6 +23,7 @@ from .reward_strategies import (
 from .spatial_strategies import create_spatial_representation_strategy
 from .other import synthesize
 from .analysis import mutual_info_policy
+from RLutils.goal_video_recorder import GoalMarkedVideoRecorder
 
 logger = logging.getLogger(__name__)
 
@@ -890,6 +892,17 @@ class PredictivePPOAlgo:
             advantages = synthesize(logs_collect["advantages"])
             for key, value in advantages.items():
                 processed[f"advantages_{key}"] = value
+
+        # Process initial goal distances (goal-conditioned variants)
+        if "distances_success" in logs_collect and len(logs_collect["distances_success"]) > 0:
+            distances_success = synthesize(logs_collect["distances_success"])
+            for key, value in distances_success.items():
+                processed[f"distance_success_{key}"] = value
+
+        if "distances_fail" in logs_collect and len(logs_collect["distances_fail"]) > 0:
+            distances_fail = synthesize(logs_collect["distances_fail"])
+            for key, value in distances_fail.items():
+                processed[f"distance_fail_{key}"] = value
         
         # Add scalar metrics from collect_experiences
         for key in ["num_episodes", "loc_entropy", "loc_entropy_5", "num_frames"]:
@@ -1002,10 +1015,14 @@ class GoalConditionedPPOAlgo(PredictivePPOAlgo):
         ppo_config: DictConfig,
         spatial_config: DictConfig,
         reward_config: DictConfig,
-        goal_pool: torch.Tensor,
+        goal_pool: Dict,
         goal_threshold: float,
         goal_strategy: Optional[GoalSelectionStrategy] = None,
         check_location: bool = False,
+        exclude_loactions: Optional[np.ndarray] = None,
+        video_log_freq: Optional[int] = None,
+        video_folder: Optional[str] = None,
+        video_ext: str = '',
         device: Optional[torch.device] = None,
         preprocess_obss=None,
     ):
@@ -1015,15 +1032,66 @@ class GoalConditionedPPOAlgo(PredictivePPOAlgo):
             goal_threshold:  Cosine-distance threshold for reaching a goal.
             goal_strategy:   How to pick a goal from the pool.
                              Defaults to :class:`RandomGoalStrategy`.
+            exclude_loactions: Optional 2xN numpy array of excluded goal
+                               coordinates where each column is [x, y].
             (other args):    Forwarded to :class:`PredictivePPOAlgo`.
         """
         # Store goal pool early so _setup_experience_buffer can use it.
         # device is resolved inside super().__init__; store raw tensor for now.
         self._goal_pool_raw = goal_pool['h']
         self._goal_locs = goal_pool['state']['agent_pos']
+        self._video_ext = video_ext
+
+        # Optionally filter out excluded goal locations.
+        if exclude_loactions is not None:
+            exclude_arr = np.asarray(exclude_loactions)
+            if exclude_arr.ndim != 2 or exclude_arr.shape[0] != 2:
+                raise ValueError(
+                    "exclude_loactions must be a 2xN numpy array "
+                    "with columns [x, y]."
+                )
+
+            excluded = {
+                (int(exclude_arr[0, i]), int(exclude_arr[1, i]))
+                for i in range(exclude_arr.shape[1])
+            }
+            goal_locs_arr = np.asarray(self._goal_locs)
+
+            keep_mask_np = np.array(
+                [tuple(map(int, loc)) not in excluded for loc in goal_locs_arr],
+                dtype=bool,
+            )
+
+            if not keep_mask_np.any():
+                raise ValueError(
+                    "All goal locations were excluded. "
+                    "Provide a less restrictive exclude_loactions set."
+                )
+
+            self._goal_locs = goal_locs_arr[keep_mask_np]
+
+            if isinstance(self._goal_pool_raw, torch.Tensor):
+                keep_mask = torch.as_tensor(keep_mask_np[:-1], device=self._goal_pool_raw.device)
+                self._goal_pool_raw = self._goal_pool_raw[:, keep_mask]
+            else:
+                self._goal_pool_raw = np.asarray(self._goal_pool_raw)[:, keep_mask_np[:-1]]
+
         self.goal_threshold = goal_threshold
         self.goal_strategy = goal_strategy or RandomGoalStrategy()
         self.check_location = check_location
+        self.video_log_freq = int(video_log_freq) if video_log_freq is not None else 0
+        self.video_folder = video_folder
+        self._video_recorder = None
+        self._episode_counter = 0
+
+        if self.video_log_freq < 0:
+            raise ValueError("video_log_freq must be >= 0")
+        if self.video_log_freq > 0:
+            if not self.video_folder:
+                raise ValueError(
+                    "video_folder must be provided when video_log_freq is enabled"
+                )
+            os.makedirs(self.video_folder, exist_ok=True)
 
         super().__init__(
             env, acmodel, predictiveNet,
@@ -1060,12 +1128,52 @@ class GoalConditionedPPOAlgo(PredictivePPOAlgo):
         """Draw a new goal from the pool using the configured strategy."""
         self.goal, idx = self.goal_strategy.select_goal(self.goal_pool)
         self.goal_loc = self._goal_locs[idx]
+        return self.goal
+
+    def _should_record_current_episode(self) -> bool:
+        """Whether the current episode should be recorded."""
+        return self.video_log_freq > 0 and self._episode_counter % self.video_log_freq == 0
+
+    def _ensure_episode_video_recorder(self) -> None:
+        """Start a recorder for the current episode when logging is enabled."""
+        if self._video_recorder is not None:
+            return
+        if not self._should_record_current_episode():
+            return
+
+        base_path = os.path.join(
+            self.video_folder,
+            f"goal_episode_{self._episode_counter:07d}_{self._video_ext}",
+        )
+        self._video_recorder = GoalMarkedVideoRecorder(
+            env=self.env.env,
+            base_path=base_path,
+            goal_location=self.goal_loc,
+            enabled=True,
+            disable_logger=True,
+        )
+        self._video_recorder.capture_frame()
+
+    def _stop_episode_video_recorder(self) -> None:
+        """Close and clear the currently active episode recorder."""
+        if self._video_recorder is None:
+            return
+        try:
+            self._video_recorder.close()
+        finally:
+            self._video_recorder = None
 
     def _set_new_goal(self) -> None:
         """Select a new goal from the pool and update the internal strategy."""
         self._select_goal()
         self.internal_strategy.set_reference(self.goal)
         logger.debug("New goal selected")
+
+    def _compute_goal_start_distance(self) -> float:
+        """Compute Euclidean distance between current location and goal location."""
+        current_loc = np.asarray(self._get_agent_pos(), dtype=np.float32)
+        goal_loc = np.asarray(self.goal_loc, dtype=np.float32)
+        return float(np.linalg.norm(current_loc - goal_loc))
 
     def _check_goal(self, loc) -> Tuple[float, bool]:
         if (loc == self.goal_loc).all():
@@ -1095,9 +1203,14 @@ class GoalConditionedPPOAlgo(PredictivePPOAlgo):
         bonus reward when the cosine distance between the new SR and the goal
         drops below *goal_threshold*.
         """
+        self._ensure_episode_video_recorder()
+
         action, dist, value, det_action = self._select_action()
 
         new_obs, reward, terminated, truncated, _ = self.env.step(det_action)
+
+        if self._video_recorder is not None:
+            self._video_recorder.capture_frame()
 
         if self.reward_config.exploration:
             reward, terminated, truncated = 0, False, False
@@ -1128,6 +1241,8 @@ class GoalConditionedPPOAlgo(PredictivePPOAlgo):
             )
         reward += reward_new
         done = done or goal_reached
+        if goal_reached:
+            self._episode_goal_reached = True
 
         # Store goal-conditioned SR so training uses the same representation
         # that was used for action selection.
@@ -1156,8 +1271,23 @@ class GoalConditionedPPOAlgo(PredictivePPOAlgo):
 
     def _handle_episode_end(self, idx: int) -> None:
         """Handle episode end AND select a fresh goal for the next episode."""
+        # Log the starting distance of the episode that just ended.
+        if self._current_episode_start_distance is not None:
+            if self._episode_goal_reached:
+                self._distances_success.append(self._current_episode_start_distance)
+            else:
+                self._distances_fail.append(self._current_episode_start_distance)
+
+        self._stop_episode_video_recorder()
+
         super()._handle_episode_end(idx)
         self._set_new_goal()
+
+        # super()._handle_episode_end resets the env, so refresh current location.
+        self.loc = self._get_agent_pos()
+        self._current_episode_start_distance = self._compute_goal_start_distance()
+        self._episode_goal_reached = False
+        self._episode_counter += 1
 
     def collect_experiences(self) -> DictList:
         """
@@ -1167,8 +1297,23 @@ class GoalConditionedPPOAlgo(PredictivePPOAlgo):
         that the first episode always has a well-defined goal even when the
         collector is called for the first time.
         """
+        self._distances_success = []
+        self._distances_fail = []
+        self._episode_goal_reached = False
+        self._stop_episode_video_recorder()
+
         self._set_new_goal()
-        return super().collect_experiences()
+        self._current_episode_start_distance = self._compute_goal_start_distance()
+
+        try:
+            exps = super().collect_experiences()
+        finally:
+            self._stop_episode_video_recorder()
+
+        self._logs_collect["distances_success"] = self._distances_success
+        self._logs_collect["distances_fail"] = self._distances_fail
+
+        return exps
 
     def _compute_augmented_rewards(self) -> None:
         """

@@ -12,3 +12,4 @@ migrate*
 
 trainRL.py
 train_RL.py
+train_RL_goal.py

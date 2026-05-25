@@ -200,6 +200,12 @@ class RL_Trainer(object):
                                               prnn_model=predictiveNet,
                                               timesteps=15000)
             goal_pool = EFS.data
+            if args.exp.exclude_goals:
+                exclude_x = np.arange(args.exp.x_min, args.exp.x_max + 1)
+                exclude_y = np.arange(args.exp.y_min, args.exp.y_max + 1)
+                exclude = np.stack(np.meshgrid(exclude_x, exclude_y, indexing="ij"), axis=-1).reshape(-1, 2)
+            else:
+                exclude = None
             algo = GoalConditionedPPOAlgo(
                 env=env,
                 acmodel=acmodel,
@@ -211,7 +217,8 @@ class RL_Trainer(object):
                 reward_config=args.rewards,
                 goal_pool=goal_pool,
                 goal_threshold=args.exp.goal_threshold,
-                check_location=args.exp.check_location
+                check_location=args.exp.check_location,
+                exclude_loactions=exclude
                 )
         else:
             algo = PredictivePPOAlgo(
