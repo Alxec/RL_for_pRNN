@@ -1,7 +1,0 @@
-input_type: 'theta_pRNN'
-exp_name: theta
-pRNN: True # Whether to use pRNN for spatial input and/or internal reward
-spatial: True # Whether to include spatial input
-theta: True
-shared_weights: True
-single_theta: True

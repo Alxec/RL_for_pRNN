@@ -1,5 +1,0 @@
-input_type: 'pRNN'
-exp_name: Masked_5+Intrinsic
-pRNN: True # Wether to use pRNN for spatial input and/or internal reward
-spatial: True
-intrinsic: True

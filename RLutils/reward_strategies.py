@@ -76,13 +76,18 @@ class InternalRewardStrategy(RewardStrategy):
             k_int: float,
             SR_size: int,
             device: torch.device,
-            num_frames: int
+            num_frames: int,
+            mask_internal: bool = False,
+            mask_indices: List[int] = None,
         ):
         self.k_int = k_int
         self.device = device
         self.ref = torch.zeros((1, SR_size), device=device)
         self.nrefs = 0
         self.rewards = torch.zeros(num_frames, device=device)
+        self.mask_internal = mask_internal
+        self.mask_indices = mask_indices
+        assert not (mask_internal and mask_indices is None), "Must provide mask_indices if mask_internal is True"
     
     def compute_rewards(self, SRs: torch.Tensor) -> torch.Tensor:
         """
@@ -100,6 +105,10 @@ class InternalRewardStrategy(RewardStrategy):
         
         SRs_cpu = SRs.cpu()
         ref_cpu = self.ref.squeeze().cpu()
+
+        if self.mask_internal:
+            SRs_cpu[:, self.mask_indices] = 0
+            ref_cpu[self.mask_indices] = 0
         
         # Compute errors for all timesteps
         errors = torch.tensor(

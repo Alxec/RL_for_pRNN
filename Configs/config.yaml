@@ -19,12 +19,8 @@ exp:
     opt_return: 0.9 # Optimal return for the environment
     # wrapper: 
     #   _target_: minigrid.wrappers.RGBImgPartialObsWrapper_HD # Environment wrapper as python class
-    input_type: '' # ['Visual_FO', 'Visual_PO', 'PC', 'CANN', 'PC+PO', 'pRNN', 'pRNN+PO','CANN+PO', 'CANN_norecurrence']
     exp_name: test
     seed: 2 # Random seed
-    with_obs: False # Whether to include visual input (in case of recurrency the one that would bypass RNN)
-    with_HD: True
-    rgb: False # Is visual input RGB?
     goal_conditioned: False # Whether to condition the policy on the goal
     goal_threshold: 0.1 # Threshold for considering a goal achieved (in terms of cosine similarity between current and goal state)
     check_location: False # Whether to check goal achievement based on location (exact match) instead of internal strategy
@@ -34,6 +30,15 @@ exp:
     onpolicy_prnn_eval: False # If True, actions chosen at prnn eval (SI, decoding, etc) are chosen on policy. 
     analyze_agent_behav: False # If true, analyze agent policy (plot policy,state distribution,and more, and calculate mutual info between state and action)
     steps: 1e6
+    exclude_goals: False
+
+
+inputs:
+    input_type: '' # ['Visual_FO', 'Visual_PO', 'PC', 'CANN', 'PC+PO', 'pRNN', 'pRNN+PO','CANN+PO', 'CANN_norecurrence']
+    with_obs: False # Whether to include visual input (in case of recurrency the one that would bypass RNN)
+    with_HD: True
+    rgb: False # Is visual input RGB?
+
 
 
 rewards:

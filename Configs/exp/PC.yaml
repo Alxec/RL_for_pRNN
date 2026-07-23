@@ -1,5 +1,0 @@
-input_type: 'PC'
-exp_name: PC
-PC: True # Wether to use fake place cells for spatial input and/or internal reward
-spatial: True # Wether to include spatial input
-with_HD: True

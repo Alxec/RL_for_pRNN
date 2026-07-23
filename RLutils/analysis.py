@@ -9,7 +9,7 @@ from scipy.stats import entropy
 from RLutils.model import ACModelSR
 from RLutils.format import get_obss_preprocessor
 from RLutils.other import device
-from RLutils.algo import PredictivePPOAlgo
+from RLutils.algo_new import PredictivePPOAlgo
 
 SCALES = {'viridis': plotly.colors.sequential.Viridis,
           'default': plotly.colors.sequential.Plasma,}
@@ -118,6 +118,7 @@ class EnvironmentFeaturesAnalysis:
         self.agent = agent # agent to collect observations
         self.rl_model = rl_model
         self.prnn = prnn_model
+        self.prnn.pRNN.to(device)
         self.timesteps = timesteps
         self.PC = PC
         _, self.preprocess_obss = get_obss_preprocessor(self.env.observation_space)
@@ -245,16 +246,14 @@ class EnvironmentFeaturesAnalysis:
                         title_x=0.5)
         fig.show()
         return fig
-    
-    def error_map(self, xref=7, yref=7, zmin=None, zmax=None, HDs=True, scale='viridis'):
-        """
-        Plot the heatmap of h_{ref} errors.
-        """
+
+    def calculate_errors(self, xref, yref):
+
         instances_map = np.zeros((4, self.env.width-2, self.env.height-2))
         errors_map = np.zeros((4, self.env.width-2, self.env.height-2))
         
         ref_ts=[]
-        for t,pos in enumerate(self.data['state']['agent_pos']):
+        for t,pos in enumerate(self.data['state']['agent_pos'][:-1]):
             if pos[0] == xref and pos[1] == yref:
                 ref_ts.append(t)
 
@@ -279,6 +278,14 @@ class EnvironmentFeaturesAnalysis:
         
         errors_map /= instances_map
 
+        return errors_map
+    
+    def error_map(self, xref=7, yref=7, zmin=None, zmax=None, HDs=True, scale='viridis'):
+        """
+        Plot the heatmap of h_{ref} errors.
+        """
+        errors_map = self.calculate_errors(xref, yref)
+
         return plot_heatmaps(errors_map, 'Errors', zmin, zmax, HDs, scale)
 
 
@@ -288,57 +295,37 @@ class OnPolicyAnalysis:
     """
     def __init__(self, PPOalgo=None, timesteps=10000, **kwargs):
         self.timesteps = timesteps
-    # def __init__(self, env, acmodel, predictiveNet=None, device=None, num_frames=None, discount=0.99, lr=0.001,
-    #              gae_lambda=0.95, entropy_coef=0.01, value_loss_coef=0.5, max_grad_norm=0.5, recurrence=1,
-    #              adam_eps=1e-8, clip_eps=0.2, epochs=4, batch_size=256, preprocess_obss=None, place_cells=None,
-    #              cann=None, train_pN=False, noise_mu=0, noise_std=0.03, prnn_seqdur=0, intrinsic=False, k_int=1,
-    #              pastSR=False, curious_agent=False, k_curious=1):
         if PPOalgo is not None:
             # Build a new algo with same params, just shorter timesteps
+            ppo_config = PPOalgo.config.copy()
+            ppo_config.num_frames = timesteps
             self.algo = PredictivePPOAlgo(
                 env=PPOalgo.env,
                 acmodel=PPOalgo.acmodel,
-                predictiveNet=PPOalgo.pN,
+                predictiveNet=PPOalgo.predictiveNet,
+                ppo_config=ppo_config,
+                spatial_config=PPOalgo.spatial_config,
+                reward_config=PPOalgo.reward_config,
                 device=PPOalgo.device,
-                num_frames=timesteps,
-                discount=PPOalgo.discount,
-                lr=PPOalgo.lr,
-                gae_lambda=PPOalgo.gae_lambda,
-                entropy_coef=PPOalgo.entropy_coef,
-                value_loss_coef=PPOalgo.value_loss_coef,
-                max_grad_norm=PPOalgo.max_grad_norm,
-                recurrence=PPOalgo.recurrence,
                 preprocess_obss=PPOalgo.preprocess_obss,
-                place_cells=PPOalgo.PC,
-                cann=PPOalgo.CANN,
-                train_pN=PPOalgo.train_pN,
-                noise_mu=PPOalgo.noise_mu,
-                noise_std=PPOalgo.noise_std,
-                prnn_seqdur=PPOalgo.prnn_seqdur,
-                intrinsic=PPOalgo.intrinsic,
-                k_int=PPOalgo.k_int,
-                pastSR=PPOalgo.pastSR,
-                curious_agent=PPOalgo.curious_agent,
-                k_curious=PPOalgo.k_curious
             )
         else:
             required_keys = [
-                'env', 'acmodel', 'predictiveNet', 'device', 
-                'discount', 'gae_lambda', 'prnn_seqdur',
-                'preprocess_obss', 'intrinsic', 'k_int',
-                'pastSR', 'curious_agent', 'k_curious'
+                'env', 'acmodel', 'predictiveNet', 'device',
+                'preprocess_obss', 'ppo_config', 'spatial_config', 'reward_config'
             ]
             for key in required_keys:
                 if key not in kwargs:
                     raise ValueError(f"Missing required argument: {key}")
-            self.algo = PredictivePPOAlgo(num_frames=timesteps, **kwargs)
+            ppo_config.num_frames = timesteps
+            self.algo = PredictivePPOAlgo(**kwargs)
         
-        _, logs = self.algo.collect_experiences()
-        self.joint_probs = logs["joint_dist"]
+        self.algo.collect_experiences()
+        self.joint_probs = self.algo._logs_collect["joint_dist"]
         self.mi = mutual_info_policy(self.joint_probs)
-        self.deltas = (self.algo.advantages[:-1] - self.algo.discount * \
-                      self.algo.gae_lambda * self.algo.advantages[1:] * self.algo.masks[1:]).cpu().numpy()
-        self.deltas = np.append(self.deltas, self.algo.advantages[-1].cpu().numpy())
+        self.deltas = (self.algo.experience_buffer.advantages[:-1] - self.algo.config.discount * \
+                      self.algo.config.gae_lambda * self.algo.experience_buffer.advantages[1:] * self.algo.experience_buffer.masks[1:]).cpu().numpy()
+        self.deltas = np.append(self.deltas, self.algo.experience_buffer.advantages[-1].cpu().numpy())
 
     def plot_advantages(self, zmin=None, zmax=None, HDs=True, scale='default'):
         """
@@ -347,13 +334,13 @@ class OnPolicyAnalysis:
         instances_map = np.zeros((4, self.algo.env.width-2, self.algo.env.height-2))
         adv_map = np.zeros((4, self.algo.env.width-2, self.algo.env.height-2))
         for t in range(self.timesteps):
-            adv_map[self.algo.obss[t]['direction'],
-                    self.algo.locs[t][0]-1,
-                    self.algo.locs[t][1]-1] += self.algo.advantages[t].cpu().numpy()
+            adv_map[self.algo.experience_buffer.obss[t]['direction'],
+                    self.algo.experience_buffer.locs[t][0]-1,
+                    self.algo.experience_buffer.locs[t][1]-1] += self.algo.experience_buffer.advantages[t].cpu().numpy()
             
-            instances_map[self.algo.obss[t]['direction'],
-                          self.algo.locs[t][0]-1,
-                          self.algo.locs[t][1]-1] += 1
+            instances_map[self.algo.experience_buffer.obss[t]['direction'],
+                          self.algo.experience_buffer.locs[t][0]-1,
+                          self.algo.experience_buffer.locs[t][1]-1] += 1
         
         adv_map /= np.maximum(instances_map, 1e-6) 
 
@@ -366,13 +353,13 @@ class OnPolicyAnalysis:
         instances_map = np.zeros((4, self.algo.env.width-2, self.algo.env.height-2))
         delta_map = np.zeros((4, self.algo.env.width-2, self.algo.env.height-2))
         for t in range(self.timesteps):
-            delta_map[self.algo.obss[t]['direction'],
-                    self.algo.locs[t][0]-1,
-                    self.algo.locs[t][1]-1] += self.deltas[t]
+            delta_map[self.algo.experience_buffer.obss[t]['direction'],
+                    self.algo.experience_buffer.locs[t][0]-1,
+                    self.algo.experience_buffer.locs[t][1]-1] += self.deltas[t]
             
-            instances_map[self.algo.obss[t]['direction'],
-                          self.algo.locs[t][0]-1,
-                          self.algo.locs[t][1]-1] += 1
+            instances_map[self.algo.experience_buffer.obss[t]['direction'],
+                          self.algo.experience_buffer.locs[t][0]-1,
+                          self.algo.experience_buffer.locs[t][1]-1] += 1
         
         delta_map /= np.maximum(instances_map, 1e-6) 
 
@@ -385,13 +372,13 @@ class OnPolicyAnalysis:
         instances_map = np.zeros((4, self.algo.env.width-2, self.algo.env.height-2))
         values_map = np.zeros((4, self.algo.env.width-2, self.algo.env.height-2))
         for t in range(self.timesteps):
-            values_map[self.algo.obss[t]['direction'],
-                       self.algo.locs[t][0]-1,
-                       self.algo.locs[t][1]-1] += self.algo.values[t].cpu().numpy()
+            values_map[self.algo.experience_buffer.obss[t]['direction'],
+                       self.algo.experience_buffer.locs[t][0]-1,
+                       self.algo.experience_buffer.locs[t][1]-1] += self.algo.experience_buffer.values[t].cpu().numpy()
             
-            instances_map[self.algo.obss[t]['direction'],
-                          self.algo.locs[t][0]-1,
-                          self.algo.locs[t][1]-1] += 1
+            instances_map[self.algo.experience_buffer.obss[t]['direction'],
+                          self.algo.experience_buffer.locs[t][0]-1,
+                          self.algo.experience_buffer.locs[t][1]-1] += 1
         
         values_map /= np.maximum(instances_map, 1e-6) 
 
@@ -458,8 +445,8 @@ class OnPolicyAnalysis:
 
         occ = np.zeros((4, self.algo.env.width-2, self.algo.env.height-2))
         for t in range(self.timesteps):
-            hd = self.algo.obss[t]['direction']
-            x, y = self.algo.locs[t][0]-1, self.algo.locs[t][1]-1
+            hd = self.algo.experience_buffer.obss[t]['direction']
+            x, y = self.algo.experience_buffer.locs[t][0]-1, self.algo.experience_buffer.locs[t][1]-1
             occ[hd, x, y] += 1
 
         fig = make_subplots(

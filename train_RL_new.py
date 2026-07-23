@@ -39,9 +39,9 @@ class RL_Trainer(object):
         date = datetime.datetime.now().strftime("%y-%m-%d-%H-%M-%S")
         if params.logging.focus:
             par = eval('params.'+params.logging.focus)
-            name = f"{params.exp.exp_name}_{params.logging.focus}_{par}_seed{params.exp.seed}"
+            name = f"{params.exp.exp_name}_{params.inputs.input_type}_{params.logging.focus}_{par}_seed{params.exp.seed}"
         else:
-            name = f"{params.exp.exp_name}_seed{params.exp.seed}"
+            name = f"{params.exp.exp_name}_{params.inputs.input_type}_seed{params.exp.seed}"
         name_date = f"{name}_{date}/"
         self.model_name = f"{params.logging.project}/{name_date}"
         if params.logging.focus:
@@ -75,7 +75,9 @@ class RL_Trainer(object):
                                 )
         
     def _initialize_predictive_net(self, args, env):
-        mask_indices = None
+        assert args.SR.mask_indices is None or args.SR.predictive_net.mask==0, \
+            "Masking is done either with predefined indices or based on criteria, but not both."
+        mask_indices = args.SR.mask_indices
         if args.SR.predictive_net.load:
             predictiveNet = PredictiveNet.loadNet(args.SR.predictive_net.path,
                                                   args.SR.predictive_net.folder)
@@ -87,19 +89,19 @@ class RL_Trainer(object):
                 if args.SR.predictive_net.mask_type=='SI':
                     si = predictiveNet.TrainingSaver.SI.item().squeeze()
                     if args.SR.predictive_net.mask_bottom:
-                        mask_indices = np.argsort(si)[:int(args.SR.predictive_net.mask*len(si))]
+                        mask_indices = (np.argsort(si)[:int(args.SR.predictive_net.mask*len(si))]).tolist()
                     else:
-                        mask_indices = np.argsort(si)[-int(args.SR.predictive_net.mask*len(si)):]
+                        mask_indices = (np.argsort(si)[-int(args.SR.predictive_net.mask*len(si)):]).tolist()
                 elif args.SR.predictive_net.mask_type=='EV':
                     evs = predictiveNet.TrainingSaver.EVs.item()
                     if args.SR.predictive_net.mask_bottom:
-                        mask_indices = np.argsort(evs)[:int(args.SR.predictive_net.mask*len(evs))]
+                        mask_indices = (np.argsort(evs)[:int(args.SR.predictive_net.mask*len(evs))]).tolist()
                     else:
-                        mask_indices = np.argsort(evs)[-int(args.SR.predictive_net.mask*len(evs)):]
+                        mask_indices = (np.argsort(evs)[-int(args.SR.predictive_net.mask*len(evs)):]).tolist()
                 elif args.SR.predictive_net.mask_type=='random':
                     np.random.seed(args.exp.seed+1234)
-                    mask_indices = np.random.choice(np.arange(predictiveNet.pRNN.hidden_size),
-                                                    size=int(args.SR.predictive_net.mask*predictiveNet.pRNN.hidden_size))
+                    mask_indices = (np.random.choice(np.arange(predictiveNet.pRNN.hidden_size),
+                                                    size=int(args.SR.predictive_net.mask*predictiveNet.pRNN.hidden_size))).tolist()
                 else:
                     raise ValueError("Mask type not recognized")
                 print(f"Masking {len(mask_indices)} neurons")
@@ -136,7 +138,7 @@ class RL_Trainer(object):
         env_key = args.exp.env_name
         env = RLutils.make_env(
                                env_key=env_key,
-                               input_type=args.exp.input_type,
+                               input_type=args.inputs.input_type,
                                spatial_config=args.SR,
                                seed=args.exp.seed + 10000,
                                vid_folder=self.video_dir,
@@ -177,16 +179,16 @@ class RL_Trainer(object):
         # Load models
         if args.exp.goal_conditioned:
             acmodel = ACModelSR(obs_space, env.action_space,
-                                args.SR.cells*2, args.exp.with_obs,
-                                args.exp.rgb, args.exp.with_HD)
+                                args.SR.cells*2, args.inputs.with_obs,
+                                args.inputs.rgb, args.inputs.with_HD)
         elif args.SR.spatial:
             acmodel = ACModelSR(obs_space, env.action_space,
-                                args.SR.cells, args.exp.with_obs,
-                                args.exp.rgb, args.exp.with_HD)
+                                args.SR.cells, args.inputs.with_obs,
+                                args.inputs.rgb, args.inputs.with_HD)
 
         else:
-            acmodel = ACModel(obs_space, env.action_space, args.exp.with_HD,
-                              args.exp.rgb)
+            acmodel = ACModel(obs_space, env.action_space, args.inputs.with_HD,
+                              args.inputs.rgb)
 
         if "model_state" in status:
             acmodel.load_state_dict(status["model_state"])
@@ -195,33 +197,7 @@ class RL_Trainer(object):
         print("AC model loaded\n")
 
         # Load algo
-        if args.exp.goal_conditioned:
-            EFS = EnvironmentFeaturesAnalysis(env, randomagent,
-                                              prnn_model=predictiveNet,
-                                              timesteps=15000)
-            goal_pool = EFS.data
-            if args.exp.exclude_goals:
-                exclude_x = np.arange(args.exp.x_min, args.exp.x_max + 1)
-                exclude_y = np.arange(args.exp.y_min, args.exp.y_max + 1)
-                exclude = np.stack(np.meshgrid(exclude_x, exclude_y, indexing="ij"), axis=-1).reshape(-1, 2)
-            else:
-                exclude = None
-            algo = GoalConditionedPPOAlgo(
-                env=env,
-                acmodel=acmodel,
-                predictiveNet=predictiveNet,
-                device=device,
-                preprocess_obss=preprocess_obss,
-                ppo_config=args.ppo,
-                spatial_config=args.SR,
-                reward_config=args.rewards,
-                goal_pool=goal_pool,
-                goal_threshold=args.exp.goal_threshold,
-                check_location=args.exp.check_location,
-                exclude_loactions=exclude
-                )
-        else:
-            algo = PredictivePPOAlgo(
+        algo = PredictivePPOAlgo(
                 env=env,
                 acmodel=acmodel,
                 predictiveNet=predictiveNet,

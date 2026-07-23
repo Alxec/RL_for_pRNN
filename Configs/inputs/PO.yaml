@@ -1,4 +1,3 @@
-input_type: 'SR+PO'
-exp_name: Masked_5_PO
+input_type: 'Visual_PO'
 with_obs: True # Whether to include visual input (in case of recurrency the one that would bypass RNN)
 rgb: True # Is visual input RGB?

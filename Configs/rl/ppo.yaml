@@ -1,5 +1,0 @@
-algo: ppo
-ppo_epochs: 4 # Number of epochs for PPO
-ppo_batch_size: 256
-ppo_clip_eps: 0.2 # Clipping epsilon for PPO\
-frames: 2048 # Number of frames before update

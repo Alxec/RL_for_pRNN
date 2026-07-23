@@ -1,6 +1,0 @@
-input_type: 'Visual_PO+Intrinsic'
-exp_name: PO+Intrinsic
-pRNN: True # Wether to use pRNN for spatial input and/or internal reward
-with_HD: True
-rgb: True # Is visual input RGB?
-intrinsic: True

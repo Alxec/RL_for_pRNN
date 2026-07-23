@@ -1,7 +1,0 @@
-input_type: 'pRNN+PO'
-exp_name: pRNN+PO+Intrinsic
-pRNN: True # Whether to use pRNN for spatial input and/or internal reward
-spatial: True # Whether to include spatial input
-with_obs: True # Whether to include visual input (in case of recurrency the one that would bypass RNN)
-rgb: True # Is visual input RGB?
-intrinsic: True

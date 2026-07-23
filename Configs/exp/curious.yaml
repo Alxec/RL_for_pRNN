@@ -1,7 +1,4 @@
-input_type: 'pRNN+PO'
 exp_name: map-learning
-with_obs: True # Whether to include visual input (in case of recurrency the one that would bypass RNN)
-rgb: True # Is visual input RGB?
 offpolicy_prnn_eval: True # If true, action output is off policy (so if PPO is being done, then actions random. Vice versa if random_action_agent)
 onpolicy_prnn_eval: True # If True, actions chosen at prnn eval (SI, decoding, etc) are chosen on policy. 
 analyze_agent_behav: True # If true, analyze agent policy (plot policy,state distribution,and more, and calculate mutual info between state and action)
