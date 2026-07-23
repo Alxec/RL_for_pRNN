@@ -14,8 +14,8 @@ import RLutils
 from RLutils.other import device
 from RLutils.model import ACModel, RecACModel, ACModelSR, ACModelTheta, ACModelThetaShared, ACModelThetaSingle
 from RLutils.agent import ActorCriticAgent
-from RLutils.algo_new import PredictivePPOAlgo, GoalConditionedPPOAlgo
-from RLutils.analysis_new import EnvironmentFeaturesAnalysis, OnPolicyAnalysis
+from RLutils.algo import PredictivePPOAlgo, GoalConditionedPPOAlgo
+from RLutils.analysis import EnvironmentFeaturesAnalysis, OnPolicyAnalysis
 from prnn.utils.predictiveNet import PredictiveNet
 from prnn.utils.thetaRNN import LayerNormRNNCell, RNNCell
 from prnn.utils.agent import create_agent

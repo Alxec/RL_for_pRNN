@@ -9,7 +9,7 @@ from scipy.stats import entropy
 from RLutils.model import ACModelSR
 from RLutils.format import get_obss_preprocessor
 from RLutils.other import device
-from RLutils.algo import PredictivePPOAlgo
+from RLutils.algo_old import PredictivePPOAlgo
 
 SCALES = {'viridis': plotly.colors.sequential.Viridis,
           'default': plotly.colors.sequential.Plasma,}
