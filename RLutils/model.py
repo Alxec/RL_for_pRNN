@@ -1,3 +1,11 @@
+"""Actor-critic model definitions used by the RL training code.
+
+``ACModelSR`` is the primary model family: it consumes a spatial
+representation (usually the hidden state of a trained pRNN) and can optionally
+combine it with a visual embedding. The Theta/Rollout variants are retained for
+future work on Theta-pRNNs and are not part of the current active workflow.
+"""
+
 # Adapted from https://github.com/ikostrikov/pytorch-a2c-ppo-acktr/blob/master/model.py
 
 
@@ -18,6 +26,14 @@ def init_params(m):
 
 
 class RecACModel(nn.Module, torch_ac.RecurrentACModel):
+    """Recurrent image-based actor-critic model.
+
+    Images are encoded by a convolutional network and passed through the
+    supplied recurrent cell before actor and critic heads. This model has not
+    yet been used in the active experiments, but is retained for future
+    recurrence-based RL work.
+    """
+
     def __init__(self, obs_space, action_space, cell, memory_size=300, with_obs=False, rgb=True, with_HD=False):
         super().__init__()
 
@@ -96,6 +112,12 @@ class RecACModel(nn.Module, torch_ac.RecurrentACModel):
     
 
 class ACModel(nn.Module, torch_ac.ACModel):
+    """Feed-forward actor-critic model for visual observations.
+
+    A convolutional image embedding, optionally augmented with one-hot head
+    direction, is consumed by separate actor and critic heads.
+    """
+
     def __init__(self, obs_space, action_space, with_HD=True, rgb=True):
         super().__init__()
         self.with_HD = with_HD
@@ -173,6 +195,13 @@ class ACModel(nn.Module, torch_ac.ACModel):
 
 
 class ACModelSR(ACModel):
+    """Primary actor-critic model operating on a spatial representation.
+
+    The spatial representation is usually a hidden state from a trained pRNN,
+    so the policy operates in the world model's latent space. It can also
+    concatenate a visual embedding and one-hot head direction in parallel.
+    """
+
     def __init__(self, obs_space, action_space, SR_size=-1, with_CV=True, 
                  rgb=True, with_HD=True):
         self.with_CV = with_CV
@@ -229,6 +258,13 @@ class ACModelSR(ACModel):
 
 
 class ACModelTheta(ACModelSR):
+    """Theta/Rollout actor-critic model for sequential pRNN outputs.
+
+    This deferred model family handles a sequence of spatial representations,
+    head directions, actions, and values from a Theta-pRNN (also called a
+    Rollout pRNN). Do not treat it as part of the active baseline workflow.
+    """
+
     def __init__(self, obs_space, action_space, SR_size=-1, with_CV=True, rgb=True,
                  k=1, V='single'):
         assert V in ['single', 'double', 'multi']
@@ -304,6 +340,12 @@ class ACModelTheta(ACModelSR):
 
 
 class ACModelThetaShared(ACModelTheta):
+    """Theta/Rollout variant with shared per-step features across a sequence.
+
+    This experimental class currently uses no visual input and is retained for
+    future Theta-pRNN/Rollout work.
+    """
+
     def __init__(self, obs_space, action_space, SR_size=-1, k=1, V='single'):
         super(ACModelThetaShared, self).__init__(obs_space, action_space, SR_size,
                                                  with_CV=False, rgb=False, k=k, V=V) # No visual input (yet)
@@ -370,6 +412,12 @@ class ACModelThetaShared(ACModelTheta):
 
 
 class ACModelThetaSingle(ACModelTheta):
+    """Theta/Rollout variant that emits a single action/value prediction.
+
+    This experimental class currently uses no visual input and is retained for
+    future Theta-pRNN/Rollout work.
+    """
+
     def __init__(self, obs_space, action_space, SR_size=-1, k=1, V='single'):
         super(ACModelThetaSingle, self).__init__(obs_space, action_space, SR_size,
                                                  with_CV=False, rgb=False, k=k, V=V)
@@ -441,5 +489,4 @@ class ACModelThetaSingle(ACModelTheta):
         # value = x.squeeze(1)
 
         return dist, value
-
 
