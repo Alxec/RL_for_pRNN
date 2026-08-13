@@ -293,8 +293,9 @@ class PredictivePPOAlgo:
             "batch_size must be divisible by recurrence"
         assert (self.spatial_config.past_SR ^ ('Next' in str(self.env.encodeAction))), \
             "pastSR configuration mismatch with environment"
-        assert (self.config.num_frames % self.spatial_config.predictive_net.seqdur == 0), \
-            "num_frames must be divisible by pRNN sequence duration"
+        if self.spatial_config.predictive_net is not None:
+            assert (self.config.num_frames % self.spatial_config.predictive_net.seqdur == 0), \
+                "num_frames must be divisible by pRNN sequence duration"
     
     def _setup_environment(self):
         """Setup environment-related attributes."""

@@ -2,22 +2,33 @@ import gymnasium as gym
 from gymnasium import spaces
 from gymnasium.core import ObservationWrapper, Wrapper
 from gymnasium.wrappers import RecordVideo
-from minigrid.wrappers import *
+from minigrid.wrappers import (
+    DictObservationSpaceWrapper,
+    DirectionObsWrapper,
+    FlatObsWrapper,
+    FullyObsWrapper,
+    ImgObsWrapper,
+    OneHotPartialObsWrapper,
+    RGBImgObsWrapper,
+    RGBImgPartialObsWrapper,
+    ReseedWrapper,
+    SymbolicObsWrapper,
+    ViewSizeWrapper,
+)
 from functools import partial
 
 import prnn.environments.Lroom
 from prnn.utils.CANNNet import CANNnet
 from prnn.utils.Shell import FaramaMinigridShell
+from prnn.utils.env import RGBImgPartialObsWrapper_HD_Farama
 
 wrappers = {
     "ReseedWrapper": ReseedWrapper,
-    "ActionBonus": ActionBonus,
-    "StateBonus": StateBonus,
     "ImgObsWrapper": ImgObsWrapper,
     "OneHotPartialObsWrapper": OneHotPartialObsWrapper,
     "RGBImgObsWrapper": RGBImgObsWrapper,
     "RGBImgPartialObsWrapper": RGBImgPartialObsWrapper,
-    "RGBImgPartialObsWrapper_HD": RGBImgPartialObsWrapper_HD,
+    "RGBImgPartialObsWrapper_HD": RGBImgPartialObsWrapper_HD_Farama,
     "FullyObsWrapper": FullyObsWrapper,
     "DictObservationSpaceWrapper": DictObservationSpaceWrapper,
     "FlatObsWrapper": FlatObsWrapper,
@@ -50,7 +61,7 @@ def make_env(
 
     elif spatial_config.predictive_net or 'PO' in input_type:
         # The same RGB wrapper is used for comparability whenever partial observation is needed
-        env = RGBImgPartialObsWrapper_HD(env, tile_size=1)
+        env = RGBImgPartialObsWrapper_HD_Farama(env, tile_size=1)
     
     else:
         # For the cases without any visual input

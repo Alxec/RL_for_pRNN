@@ -9,7 +9,6 @@ from scipy.stats import entropy
 from RLutils.model import ACModelSR
 from RLutils.format import get_obss_preprocessor
 from RLutils.other import device
-from RLutils.algo import PredictivePPOAlgo
 
 SCALES = {'viridis': plotly.colors.sequential.Viridis,
           'default': plotly.colors.sequential.Plasma,}
@@ -118,7 +117,8 @@ class EnvironmentFeaturesAnalysis:
         self.agent = agent # agent to collect observations
         self.rl_model = rl_model
         self.prnn = prnn_model
-        self.prnn.pRNN.to(device)
+        if self.prnn is not None:
+            self.prnn.pRNN.to(device)
         self.timesteps = timesteps
         self.PC = PC
         _, self.preprocess_obss = get_obss_preprocessor(self.env.observation_space)
@@ -294,6 +294,10 @@ class OnPolicyAnalysis:
     Class for analyzing the on-policy representations of the environment learned or used by RL agent.
     """
     def __init__(self, PPOalgo=None, timesteps=10000, **kwargs):
+        # Imported lazily because ``RLutils.algo`` imports ``mutual_info_policy``
+        # from this module during its own initialization.
+        from RLutils.algo import PredictivePPOAlgo
+
         self.timesteps = timesteps
         if PPOalgo is not None:
             # Build a new algo with same params, just shorter timesteps
