@@ -70,6 +70,10 @@ class ExperienceBuffer:
         self.done_indices = [0]
         self.last_observations = []
         self.last_actions = []
+        # In past-SR PPO, the first stored SR after an environment reset is a
+        # zero placeholder.  Keep the actual SR from the preceding terminal
+        # action so intrinsic rewards can retain the within-episode transition.
+        self.past_SR_terminal_states = {}
     
     def store_step(self, idx: int, step_data: StepData):
         """Store data from a single step."""
@@ -88,17 +92,26 @@ class ExperienceBuffer:
         """Store additional reward signals."""
         self.all_rewards[name] = rewards
     
-    def add_traj_end(self, idx: int, obs: Dict, act: np.ndarray):
+    def add_traj_end(
+            self,
+            idx: int,
+            obs: Dict,
+            act: np.ndarray,
+            past_SR_terminal_state: torch.Tensor | None = None,
+        ):
         """Mark trajectory end for pRNN training."""
         self.done_indices.append(idx + 1)
         self.last_observations.append(obs)
         self.last_actions.append(act)
+        if past_SR_terminal_state is not None:
+            self.past_SR_terminal_states[idx] = past_SR_terminal_state.detach().clone()
 
     def reset_trajectories(self):
         """Reset trajectory tracking."""
         self.done_indices = [0]
         self.last_observations = []
         self.last_actions = []
+        self.past_SR_terminal_states = {}
     
     def compute_advantages(
             self,
@@ -499,7 +512,14 @@ class PredictivePPOAlgo:
         
         # Record episode metrics
         self.metrics.episode_done()
-        self.experience_buffer.add_traj_end(idx, self.obs, det_action)
+        terminal_state = None
+        if self.spatial_config.past_SR:
+            # ``self.SR`` is the state produced by the terminal action.  It is
+            # replaced by a zero placeholder for the next episode below.
+            terminal_state = self.SR.squeeze(0)
+        self.experience_buffer.add_traj_end(
+            idx, self.obs, det_action, past_SR_terminal_state=terminal_state
+        )
         
         # Reset environment and SR
         if self.spatial_config.predictive_net:
@@ -528,9 +548,14 @@ class PredictivePPOAlgo:
                     obs=self.obs
                 )
                 SRs_all = torch.cat((self.experience_buffer.SRs[1:], SR_last), dim=0)
+                SRs_all = self._substitute_past_SR_terminal_states(SRs_all)
+                episode_end_indices = self.experience_buffer.past_SR_terminal_states.keys()
             else:
                 SRs_all = self.experience_buffer.SRs
-            internal_rewards = self.internal_strategy.compute_rewards(SRs=SRs_all)
+                episode_end_indices = None
+            internal_rewards = self.internal_strategy.compute_rewards(
+                SRs=SRs_all, episode_end_indices=episode_end_indices
+            )
             
             self.experience_buffer.store_rewards('internal', internal_rewards)
         
@@ -547,6 +572,23 @@ class PredictivePPOAlgo:
                 last_actions=self.experience_buffer.last_actions
             )
             self.experience_buffer.store_rewards('curious', curious_rewards)
+
+    def _substitute_past_SR_terminal_states(self, SRs: torch.Tensor) -> torch.Tensor:
+        """Replace shifted reset placeholders with terminal pRNN states.
+
+        ``SRs[t]`` is the pRNN state reached by the action at rollout index
+        ``t``.  For a completed episode, the state at that index would
+        otherwise be the zero SR stored at the next episode's first action.
+        """
+        if not self.experience_buffer.past_SR_terminal_states:
+            return SRs
+
+        aligned_SRs = SRs.clone()
+        for index, terminal_state in self.experience_buffer.past_SR_terminal_states.items():
+            aligned_SRs[index] = terminal_state.to(
+                device=aligned_SRs.device, dtype=aligned_SRs.dtype
+            )
+        return aligned_SRs
     
     def _compute_joint_probabilities(self) -> np.ndarray:
         """Compute joint probability distribution over states and actions."""
@@ -587,6 +629,7 @@ class PredictivePPOAlgo:
             experiences: DictList containing all experience data
         """
         logger.debug("Starting experience collection")
+        self.experience_buffer.past_SR_terminal_states = {}
         
         # Collect experiences
         any_done = False
@@ -1340,10 +1383,15 @@ class GoalConditionedPPOAlgo(PredictivePPOAlgo):
                 raw_SRs = torch.cat(
                     (self.experience_buffer.SRs[1:, :raw_sr_size], SR_last), dim=0
                 )
+                raw_SRs = self._substitute_past_SR_terminal_states(raw_SRs)
+                episode_end_indices = self.experience_buffer.past_SR_terminal_states.keys()
             else:
                 raw_SRs = self.experience_buffer.SRs[:, :raw_sr_size]
+                episode_end_indices = None
 
-            internal_rewards = self.internal_strategy.compute_rewards(SRs=raw_SRs)
+            internal_rewards = self.internal_strategy.compute_rewards(
+                SRs=raw_SRs, episode_end_indices=episode_end_indices
+            )
             self.experience_buffer.store_rewards("internal", internal_rewards)
 
         # --- Curious rewards (unchanged from base class) -----------------

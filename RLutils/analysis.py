@@ -36,7 +36,7 @@ def mutual_info_policy(joint_dist):
 
     return mi
 
-def plot_heatmaps(feature, title='', zmin=None, zmax=None, HDs=True, scale='default'):
+def plot_heatmaps(feature, title='', zmin=None, zmax=None, HDs=True, scale='default', show_fig=True):
         """
         Plot the heatmaps of a feature.
         """
@@ -105,7 +105,8 @@ def plot_heatmaps(feature, title='', zmin=None, zmax=None, HDs=True, scale='defa
                         font={'size':24, 'family':'Courier'},
                         showarrow=False)
 
-        fig.show()
+        if show_fig:
+            fig.show()
         return fig
 
 class EnvironmentFeaturesAnalysis:
@@ -174,7 +175,7 @@ class EnvironmentFeaturesAnalysis:
 
         return np.array(probs), np.array(values)
     
-    def values_map(self, zmin=None, zmax=None, HDs=True, scale='default'):
+    def values_map(self, zmin=None, zmax=None, HDs=True, scale='default', show_fig=True):
         """
         Plot the heatmaps of values.
         """
@@ -191,9 +192,9 @@ class EnvironmentFeaturesAnalysis:
         
         values_map /= instances_map
 
-        return plot_heatmaps(values_map, 'Values', zmin, zmax, HDs, scale)
-    
-    def policy_map(self):
+        return plot_heatmaps(values_map, 'Values', zmin, zmax, HDs, scale, show_fig)
+
+    def policy_map(self, show_fig=True):
         """
         Plot the heatmap of values.
         """
@@ -244,7 +245,8 @@ class EnvironmentFeaturesAnalysis:
         fig.update_layout(height=500, width=600,
                         title_text='Policy',
                         title_x=0.5)
-        fig.show()
+        if show_fig:
+            fig.show()
         return fig
 
     def calculate_errors(self, xref, yref):
@@ -280,13 +282,13 @@ class EnvironmentFeaturesAnalysis:
 
         return errors_map
     
-    def error_map(self, xref=7, yref=7, zmin=None, zmax=None, HDs=True, scale='viridis'):
+    def error_map(self, xref=7, yref=7, zmin=None, zmax=None, HDs=True, scale='viridis', show_fig=True):
         """
         Plot the heatmap of h_{ref} errors.
         """
         errors_map = self.calculate_errors(xref, yref)
 
-        return plot_heatmaps(errors_map, 'Errors', zmin, zmax, HDs, scale)
+        return plot_heatmaps(errors_map, 'Errors', zmin, zmax, HDs, scale, show_fig)
 
 
 class OnPolicyAnalysis:

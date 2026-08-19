@@ -7,7 +7,7 @@ to enhance learning through internal rewards and curiosity-driven exploration.
 
 import logging
 from abc import ABC, abstractmethod
-from typing import List, Dict, Tuple
+from typing import Iterable, List, Dict, Tuple
 
 import torch
 import numpy as np
@@ -89,13 +89,19 @@ class InternalRewardStrategy(RewardStrategy):
         self.mask_indices = mask_indices
         assert not (mask_internal and mask_indices is None), "Must provide mask_indices if mask_internal is True"
     
-    def compute_rewards(self, SRs: torch.Tensor) -> torch.Tensor:
+    def compute_rewards(
+            self,
+            SRs: torch.Tensor,
+            episode_end_indices: Iterable[int] | None = None,
+        ) -> torch.Tensor:
         """
         Compute internal rewards based on cosine distance to reference SR.
         
         Args:
             SRs: Spatial representations [num_frames, SR_dim]
-            pastSR: Whether using past SR mode
+            episode_end_indices: Positions in ``SRs`` that end an episode.
+                When provided, the reward delta from that terminal state to
+                the first state of the next episode is zeroed.
         
         Returns:
             Internal rewards [num_frames]
@@ -119,6 +125,13 @@ class InternalRewardStrategy(RewardStrategy):
         
         # Internal reward is decrease in error
         internal_rewards = errors[:-1] - errors[1:]
+        if episode_end_indices is not None:
+            cross_episode_indices = [
+                index + 1 for index in episode_end_indices
+                if index + 1 < len(internal_rewards)
+            ]
+            if cross_episode_indices:
+                internal_rewards[cross_episode_indices] = 0
         return self.k_int * internal_rewards
     
     def update_reference(self, SR: torch.Tensor):
