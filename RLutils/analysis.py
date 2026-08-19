@@ -9,9 +9,26 @@ from scipy.stats import entropy
 from RLutils.model import ACModelSR
 from RLutils.format import get_obss_preprocessor
 from RLutils.other import device
+from prnn.utils.Architectures import pRNN_th
 
 SCALES = {'viridis': plotly.colors.sequential.Viridis,
           'default': plotly.colors.sequential.Plasma,}
+
+
+def policy_spatial_activity(prnn, activity: torch.Tensor) -> torch.Tensor:
+    """Select the one pRNN state per timestep consumed by the RL policy.
+
+    A standard pRNN emits one state at every environmental timestep. A
+    :class:`pRNN_th` rollout model instead emits one state for each theta step.
+    PPO's active ``ACModelSR`` consumes a single response to the recorded
+    observation-action input. For rollout pRNNs, analysis therefore uses the
+    initial theta response. ``continuousTheta`` governs state propagation
+    between pRNN inputs and does not change this per-input analysis state.
+    """
+    if not isinstance(prnn.pRNN, pRNN_th):
+        return activity
+
+    return activity[0:1]
 
 def mutual_info_policy(joint_dist):
     """
@@ -139,7 +156,8 @@ class EnvironmentFeaturesAnalysis:
             prnn_obs, prnn_act, data['state'], _, data['obs'] = \
                 self.env.collectObservationSequence(self.agent, self.timesteps, save_env=True)
             with torch.no_grad():
-                _, _, data['h'] = self.prnn.predict(prnn_obs.to(device), prnn_act.to(device))
+                _, _, activity = self.prnn.predict(prnn_obs.to(device), prnn_act.to(device))
+            data['h'] = policy_spatial_activity(self.prnn, activity)
 
         elif self.PC:
             print('Collecting PC observations...')
