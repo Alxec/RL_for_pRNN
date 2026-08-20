@@ -30,6 +30,26 @@ def policy_spatial_activity(prnn, activity: torch.Tensor) -> torch.Tensor:
 
     return activity[0:1]
 
+
+def analysis_horizon(requested_timesteps: int, data: dict) -> int:
+    """Return the number of aligned environment/pRNN states available.
+
+    Rollout pRNN inference shortens a trajectory by ``k`` because the final
+    inputs lack a complete future-action window.  Maps and policy evaluation
+    must use that shorter common horizon rather than the requested collection
+    length.
+    """
+    horizons = [requested_timesteps, len(data["obs"]) - 1]
+    if "h" in data:
+        horizons.append(data["h"].size(1))
+
+    state = data.get("state", {})
+    for key in ("agent_pos", "agent_dir"):
+        if key in state:
+            horizons.append(len(state[key]) - 1)
+
+    return min(horizons)
+
 def mutual_info_policy(joint_dist):
     """
     Compute I(S;A) from the un-normalized joint_probs array
@@ -168,7 +188,8 @@ class EnvironmentFeaturesAnalysis:
             print('Collecting environment observations...')
             data['obs'], _, data['state'], _ = self.agent.getObservations(self.env, self.timesteps)
 
-        print('Collected {} steps for analysis'.format(len(data['obs'])-1))
+        self.timesteps = analysis_horizon(self.timesteps, data)
+        print('Collected {} aligned steps for analysis'.format(self.timesteps))
 
         return data
     
@@ -273,7 +294,7 @@ class EnvironmentFeaturesAnalysis:
         errors_map = np.zeros((4, self.env.width-2, self.env.height-2))
         
         ref_ts=[]
-        for t,pos in enumerate(self.data['state']['agent_pos'][:-1]):
+        for t, pos in enumerate(self.data['state']['agent_pos'][: self.timesteps]):
             if pos[0] == xref and pos[1] == yref:
                 ref_ts.append(t)
 
