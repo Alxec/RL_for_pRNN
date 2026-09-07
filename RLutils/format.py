@@ -19,7 +19,22 @@ def get_obss_preprocessor(obs_space):
                 "image": preprocess_images(obss, device=device)
             })
 
-    # Check if it is a MiniGrid observation space with HD
+    # Miniworld image observations with a configurable, discretised HD.
+    # This must precede MiniGrid's symbolic ``HD`` case below.
+    elif (
+        isinstance(obs_space, gym.spaces.Dict)
+        and "image" in obs_space.spaces
+        and "HD" in obs_space.spaces
+    ):
+        obs_space = {"image": obs_space.spaces["image"].shape, "HD": 1}
+
+        def preprocess_obss(obss, device=None):
+            return DictList({
+                "image": preprocess_images([obs["image"] for obs in obss], device=device),
+                "HD": preprocess_int([obs["HD"] for obs in obss], device=device),
+            })
+
+    # Check if it is a MiniGrid symbolic observation space with HD
     elif isinstance(obs_space, gym.spaces.Dict) and "HD" in obs_space.spaces.keys():
         obs_space = {"direction": 1,
                      "text": 100}

@@ -1,4 +1,5 @@
 import gymnasium as gym
+import numpy as np
 from gymnasium import spaces
 from gymnasium.core import ObservationWrapper, Wrapper
 from gymnasium.wrappers import RecordVideo
@@ -19,7 +20,12 @@ from functools import partial
 
 import prnn.environments.Lroom
 from prnn.utils.CANNNet import CANNnet
-from prnn.utils.Shell import FaramaMinigridShell
+from prnn.utils.Shell import (
+    FaramaMinigridShell,
+    MiniworldContrastiveShell,
+    MiniworldShell,
+    MiniworldVAEShell,
+)
 from prnn.utils.env import RGBImgPartialObsWrapper_HD_Farama
 
 wrappers = {
@@ -41,7 +47,51 @@ wrappers = {
 def episode_video_trigger(episode, vid_n_episodes):
     return episode % vid_n_episodes == 0
 
-def make_env(
+
+MINIWORLD_SHELL_TYPES = {
+    "autoencoder": MiniworldShell,
+    "vae": MiniworldVAEShell,
+    "contrastive": MiniworldContrastiveShell,
+}
+
+
+def miniworld_shell_type(shell):
+    """Return the registered RL Shell type for a loaded Miniworld pRNN."""
+    # Check encoder-specific subclasses before their MiniworldShell base class.
+    for shell_type in ("vae", "contrastive", "autoencoder"):
+        if isinstance(shell, MINIWORLD_SHELL_TYPES[shell_type]):
+            return shell_type
+    supported = ", ".join(sorted(MINIWORLD_SHELL_TYPES))
+    raise TypeError(
+        f"Unsupported Miniworld Shell {type(shell).__name__}; supported types: {supported}."
+    )
+
+
+def make_miniworld_shell(env, act_enc, env_key, HDbins, shell_type="autoencoder", encoder=None):
+    """Wrap a Miniworld Gym environment in the requested pRNN Shell.
+
+    This RL-side registry keeps pRNN free of RL-specific construction logic.
+    Add future Shell families here without changing the pRNN package.
+    """
+    try:
+        shell_class = MINIWORLD_SHELL_TYPES[shell_type]
+    except KeyError as error:
+        supported = ", ".join(sorted(MINIWORLD_SHELL_TYPES))
+        raise ValueError(
+            f"Unknown Miniworld Shell type {shell_type!r}; supported types: {supported}."
+        ) from error
+
+    if shell_class is MiniworldShell:
+        return shell_class(env, act_enc, env_key, HDbins=HDbins)
+    if encoder is None:
+        raise ValueError(
+            f"Miniworld Shell type {shell_type!r} requires its trained encoder."
+        )
+    if shell_class is MiniworldVAEShell:
+        return shell_class(env, act_enc, env_key, vae=encoder, HDbins=HDbins)
+    return shell_class(env, act_enc, env_key, encoder=encoder, HDbins=HDbins)
+
+def make_minigrid_env(
              env_key,
              input_type,
              spatial_config,
@@ -53,6 +103,8 @@ def make_env(
              act_enc=None,
              **kwargs
              ):
+    """Build the established discrete Farama MiniGrid RL environment."""
+
     env = gym.make(env_key, render_mode=render_mode)
 
     if input_type == 'Visual_FO':
@@ -79,13 +131,63 @@ def make_env(
     env.reset(seed=seed)
     env = FaramaMinigridShell(env, act_enc, env_key)
 
-    # if 'pRNN' in input_type or 'CANN' in input_type or 'Intrinsic' in input_type:
-    #     env = FaramaMinigridShell(env, act_enc, env_key)
-    # else:
-    #     env = ResetWrapper(env)
-    #     env.reset(seed=seed)
-
     return env
+
+
+def make_miniworld_env(
+        env_key,
+        input_type,
+        seed=0,
+        vid_folder='',
+        vid_n_episodes=0,
+        render_mode='rgb_array',
+        act_enc='ContSpeedOnehotHDMiniworld',
+        continuous_actions=True,
+        hd_bins=12,
+        shell_type='autoencoder',
+        shell_encoder=None,
+        with_HD=False,
+        **kwargs,
+):
+    """Create a Miniworld Shell for continuous-action visual RL.
+
+    Miniworld's ordinary observation is the agent camera (partial
+    observation).  ``Visual_FO`` instead uses a top-down RGB observation;
+    rendering uses the same viewpoint, so recorded videos match the policy
+    input mode.
+    """
+    import prnn.environments.Miniworld  # Register project Miniworld tasks.
+
+    view = 'top' if input_type == 'Visual_FO' else 'agent'
+    env = gym.make(
+        env_key,
+        continuous=continuous_actions,
+        render_mode=render_mode,
+        view=view,
+        obs_width=64,
+        obs_height=64,
+        window_width=64,
+        window_height=64,
+        **kwargs,
+    )
+    if input_type == 'Visual_FO':
+        env = MiniworldFullyObservableWrapper(env)
+    if with_HD:
+        env = MiniworldHeadDirectionObsWrapper(env, hd_bins=hd_bins)
+
+    if vid_n_episodes:
+        trigger_func = partial(episode_video_trigger, vid_n_episodes=vid_n_episodes)
+        env = RecordVideo(env, video_folder=vid_folder, episode_trigger=trigger_func)
+
+    env.reset(seed=seed)
+    return make_miniworld_shell(
+        env,
+        act_enc,
+        env_key,
+        HDbins=hd_bins,
+        shell_type=shell_type,
+        encoder=shell_encoder,
+    )
 
 
 class ResetWrapper(Wrapper):
@@ -121,3 +223,45 @@ class HDObsWrapper(ObservationWrapper):
             'mission': obs['mission'],
             'HD': obs['direction']
         }
+
+
+class MiniworldFullyObservableWrapper(ObservationWrapper):
+    """Replace Miniworld's agent-view observation with its top-down RGB view."""
+
+    def __init__(self, env):
+        super().__init__(env)
+        # Miniworld uses the same framebuffer dimensions for observations and
+        # top-down rendering when no framebuffer is supplied.
+        self.observation_space = spaces.Box(
+            low=0,
+            high=255,
+            shape=env.observation_space.shape,
+            dtype=env.observation_space.dtype,
+        )
+
+    def observation(self, _obs):
+        return self.env.unwrapped.render_top_view()
+
+
+class MiniworldHeadDirectionObsWrapper(ObservationWrapper):
+    """Attach Miniworld's discretised continuous HD to image observations.
+
+    The binning deliberately matches ``ContSpeed*HDMiniworld`` in pRNN's
+    action encodings.  MiniGrid's four cardinal directions are unrelated to
+    this configurable continuous-world representation.
+    """
+
+    def __init__(self, env, hd_bins):
+        super().__init__(env)
+        self.hd_bins = int(hd_bins)
+        if self.hd_bins < 1:
+            raise ValueError("Miniworld hd_bins must be at least one.")
+        self.observation_space = spaces.Dict({
+            "image": env.observation_space,
+            "HD": spaces.Discrete(self.hd_bins),
+        })
+
+    def observation(self, obs):
+        hd = float(self.env.unwrapped.agent.dir) % (2 * np.pi)
+        hd_bin = min(int(hd / (2 * np.pi) * self.hd_bins), self.hd_bins - 1)
+        return {"image": obs, "HD": hd_bin}

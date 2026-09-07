@@ -7,6 +7,7 @@ from typing import Optional, List, Dict, Tuple, Any
 
 import torch
 import numpy as np
+import gymnasium as gym
 from scipy.stats import entropy
 from scipy.spatial.distance import cosine
 from torch.distributions import Categorical, kl_divergence
@@ -50,7 +51,13 @@ class StepData:
 class ExperienceBuffer:
     """Buffer for storing and managing experience data."""
     
-    def __init__(self, num_frames: int, SR_size: int, device: torch.device):
+    def __init__(
+            self,
+            num_frames: int,
+            SR_size: int,
+            device: torch.device,
+            action_space=None,
+    ):
         self.num_frames = num_frames
         self.device = device
         
@@ -58,7 +65,13 @@ class ExperienceBuffer:
         self.obss = [None] * num_frames
         self.locs = [None] * num_frames
         self.masks = torch.zeros(num_frames, device=device)
-        self.actions = torch.zeros(num_frames, device=device, dtype=torch.int)
+        self.continuous_actions = isinstance(action_space, gym.spaces.Box)
+        if self.continuous_actions:
+            self.actions = torch.zeros(
+                (num_frames, *action_space.shape), device=device, dtype=torch.float32
+            )
+        else:
+            self.actions = torch.zeros(num_frames, device=device, dtype=torch.int)
         self.values = torch.zeros(num_frames, device=device)
         self.SRs = torch.zeros((num_frames, SR_size), device=device)
         self.rewards = torch.zeros(num_frames, device=device)
@@ -157,6 +170,7 @@ class MetricsTracker:
     def __init__(self, env, loc_mask: List[bool]):
         self.env = env
         self.loc_mask = loc_mask
+        self.continuous = bool(getattr(env, "continuous", False))
         
         # Episode metrics
         self.episode_return = 0
@@ -169,8 +183,8 @@ class MetricsTracker:
         
         # Location tracking
         # NOTE: specific for Minigrid
-        self.loc_visits = np.zeros([env.width, env.height])
-        self.loc_history = [np.zeros(np.sum(loc_mask))] * 5
+        self.loc_visits = None if self.continuous else np.zeros([env.width, env.height])
+        self.loc_history = None if self.continuous else [np.zeros(np.sum(loc_mask))] * 5
     
     def update_step(self, reward: float, past_reward: Optional[float] = None):
         """Update metrics for a single step."""
@@ -181,6 +195,8 @@ class MetricsTracker:
     
     def update_location_visit(self, loc: Tuple[int, int]):
         """Track location visit."""
+        if self.continuous:
+            return
         self.loc_visits[loc] += 1
     
     def episode_done(self):
@@ -195,6 +211,10 @@ class MetricsTracker:
     
     def compute_location_entropy(self) -> Tuple[float, float]:
         """Compute location entropy metrics."""
+        if self.continuous:
+            # Grid-cell occupancy/entropy is a MiniGrid diagnostic.  Do not
+            # silently quantise continuous Miniworld positions here.
+            return float("nan"), float("nan")
         visits_filtered = self.loc_visits.flatten('F')[self.loc_mask]
         loc_entropy = entropy(visits_filtered, base=2)
         
@@ -243,7 +263,8 @@ class PredictivePPOAlgo:
         spatial_config: DictConfig,
         reward_config: DictConfig,
         device: Optional[torch.device] = None,
-        preprocess_obss=None
+        preprocess_obss=None,
+        joint_probabilities: bool = True,
     ):
         """
         Initialize PPO algorithm with modular configuration.
@@ -271,6 +292,8 @@ class PredictivePPOAlgo:
         self.config = ppo_config
         self.spatial_config = spatial_config
         self.reward_config = reward_config
+        self.continuous_actions = isinstance(self.env.action_space, gym.spaces.Box)
+        self.log_joint_probabilities = bool(joint_probabilities) and not self.continuous_actions
         
         # Validate configurations
         self._validate_config()
@@ -312,6 +335,12 @@ class PredictivePPOAlgo:
     
     def _setup_environment(self):
         """Setup environment-related attributes."""
+        if getattr(self.env, "continuous", False):
+            self.loc_mask = []
+            self.obs = self.env.reset()
+            self.loc = self._get_agent_pos()
+            self.mask = 1
+            return
         # Get location mask
         # NOTE: specific for Minigrid
         if hasattr(self.env, 'loc_mask'):
@@ -386,7 +415,8 @@ class PredictivePPOAlgo:
         self.experience_buffer = ExperienceBuffer(
             num_frames=self.config.num_frames,
             SR_size=SR_size,
-            device=self.device
+            device=self.device,
+            action_space=self.env.action_space,
         )
     
     def _setup_metrics(self):
@@ -398,6 +428,11 @@ class PredictivePPOAlgo:
         prior = getattr(self.config, 'policy_prior', None)
         kl_coef = getattr(self.config, 'prior_kl_coef', 0.0)
         
+        if self.continuous_actions and prior is not None and kl_coef > 0.0:
+            raise ValueError(
+                "Categorical policy_prior is not defined for continuous actions. "
+                "Set ppo.prior_kl_coef=0 for Miniworld PPO."
+            )
         if prior is not None and kl_coef > 0.0:
             # Accept list/ListConfig/tensor
             prior_list = OmegaConf.to_container(prior) if hasattr(prior, '_metadata') else list(prior)
@@ -424,6 +459,44 @@ class PredictivePPOAlgo:
             return self.env.get_agent_pos()
         else:
             return self.env.agent_pos
+
+    def _get_hd(self):
+        """Return the current continuous HD when the Shell exposes one."""
+        if hasattr(self.env, "get_agent_dir"):
+            return self.env.get_agent_dir()
+        return None
+
+    def _state_for_prnn(self, hd=None):
+        """Provide the HD belonging to the observation sent to pRNN.
+
+        Miniworld Shells expand this one HD only as an encoding detail. They
+        must not receive a past/current HD pair: for past-SR networks the
+        selected observation is ``o_t`` and gets ``HD_t``; for an offset-action
+        current-SR network it is ``o_(t+1)`` and gets ``HD_(t+1)`` alongside
+        the action's already-available previous speed.
+        """
+        if hd is None:
+            hd = self._get_hd()
+        if hd is None:
+            return None
+        return {"agent_dir": np.float32(hd)}
+
+    def _hd_for_spatial_representation(self, past_hd, current_hd):
+        """Choose HD from the same timestep as the strategy's observation."""
+        return past_hd if self.spatial_config.past_SR else current_hd
+
+    def _environment_action(self, action: torch.Tensor):
+        """Convert a one-policy-batch action into Gymnasium's scalar/vector form."""
+        action_cpu = action.detach().cpu()
+        if self.continuous_actions:
+            return action_cpu.squeeze(0).numpy()
+        return int(action_cpu.item())
+
+    @staticmethod
+    def _policy_log_prob(dist, action: torch.Tensor) -> torch.Tensor:
+        """Return one joint action log probability per batch item."""
+        log_prob = dist.log_prob(action)
+        return log_prob.sum(dim=-1) if log_prob.ndim > 1 else log_prob
     
     def _select_action(self) -> Tuple[torch.Tensor, Any, torch.Tensor, np.ndarray]:
         """
@@ -438,7 +511,7 @@ class PredictivePPOAlgo:
             dist, value = self.acmodel(preprocessed_obs, SR=self.SR)
         
         action = dist.sample()
-        det_action = action.cpu().numpy()
+        det_action = self._environment_action(action)
         
         return action, dist, value, det_action
     
@@ -454,6 +527,7 @@ class PredictivePPOAlgo:
         """
         # Select action
         action, dist, value, det_action = self._select_action()
+        past_hd = self._get_hd()
         
         # Execute action
         new_obs, reward, terminated, truncated, _ = self.env.step(det_action)
@@ -467,23 +541,27 @@ class PredictivePPOAlgo:
                 (idx + 1) % self.spatial_config.predictive_net.seqdur == 0)
         
         new_loc = self._get_agent_pos()
+        current_hd = self._get_hd()
         
         # Compute spatial representation
         SR_new = self.SR_strategy.compute_SR(
             action=det_action,
             past_obs=self.obs,
-            new_obs=new_obs
+            new_obs=new_obs,
+            state=self._state_for_prnn(
+                self._hd_for_spatial_representation(past_hd, current_hd)
+            ),
             )
         
         # Create step data
         step_data = StepData(
             obs=self.obs,
-            action=action,
+            action=action.squeeze(0),
             reward=reward,
             value=value,
             SR=self.SR,
             dist=dist,
-            log_prob=dist.log_prob(action),
+            log_prob=self._policy_log_prob(dist, action).squeeze(0),
             loc=self.loc,
             mask=self.mask,
         )
@@ -506,7 +584,8 @@ class PredictivePPOAlgo:
             SR = self.SR_strategy.last_SR(
                 SR=self.SR,
                 det_action=det_action,
-                obs=self.obs
+                obs=self.obs,
+                state=self._state_for_prnn(),
             )
             self.internal_strategy.update_reference(SR)
         
@@ -545,7 +624,8 @@ class PredictivePPOAlgo:
                 SR_last = self.SR_strategy.last_SR(
                     SR=self.SR,
                     det_action=det_action,
-                    obs=self.obs
+                    obs=self.obs,
+                    state=self._state_for_prnn(),
                 )
                 SRs_all = torch.cat((self.experience_buffer.SRs[1:], SR_last), dim=0)
                 SRs_all = self._substitute_past_SR_terminal_states(SRs_all)
@@ -676,7 +756,7 @@ class PredictivePPOAlgo:
         # Compute metrics
         loc_entropy, loc_entropy_5 = self.metrics.compute_location_entropy()
         returns, num_frames = self.metrics.get_episode_logs()
-        joint_probs = self._compute_joint_probabilities()
+        joint_probs = self._compute_joint_probabilities() if self.log_joint_probabilities else None
         
         # Store logs
         self._logs_collect = {
@@ -688,8 +768,9 @@ class PredictivePPOAlgo:
             "advantages": self.experience_buffer.advantages.tolist(),
             "loc_entropy": loc_entropy,
             "loc_entropy_5": loc_entropy_5,
-            "joint_dist": joint_probs
         }
+        if joint_probs is not None:
+            self._logs_collect["joint_dist"] = joint_probs
         
         if self.internal_strategy:
             self._logs_collect["internal_rewards"] = \
@@ -719,7 +800,7 @@ class PredictivePPOAlgo:
         
         # Policy loss (PPO clip objective)
         policy_entropy = dist.entropy().mean()
-        ratio = torch.exp(dist.log_prob(sb.action) - sb.log_prob)
+        ratio = torch.exp(self._policy_log_prob(dist, sb.action) - sb.log_prob)
         surr1 = ratio * sb.advantage
         surr2 = torch.clamp(ratio, 1.0 - self.config.clip_eps, 
                            1.0 + self.config.clip_eps) * sb.advantage
@@ -1154,6 +1235,7 @@ class GoalConditionedPPOAlgo(PredictivePPOAlgo):
             num_frames=self.config.num_frames,
             SR_size=raw_SR_size * 2,
             device=self.device,
+            action_space=self.env.action_space,
         )
 
         # InternalRewardStrategy is required for goal-reaching checks.
@@ -1239,7 +1321,7 @@ class GoalConditionedPPOAlgo(PredictivePPOAlgo):
             dist, value = self.acmodel(preprocessed_obs, SR=goal_conditioned_SR)
 
         action = dist.sample()
-        det_action = action.cpu().numpy()
+        det_action = self._environment_action(action)
         return action, dist, value, det_action
 
     def _collect_single_step(self, idx: int) -> Tuple[StepData, bool]:
@@ -1251,6 +1333,7 @@ class GoalConditionedPPOAlgo(PredictivePPOAlgo):
         self._ensure_episode_video_recorder()
 
         action, dist, value, det_action = self._select_action()
+        past_hd = self._get_hd()
 
         new_obs, reward, terminated, truncated, _ = self.env.step(det_action)
 
@@ -1267,11 +1350,15 @@ class GoalConditionedPPOAlgo(PredictivePPOAlgo):
         )
 
         new_loc = self._get_agent_pos()
+        current_hd = self._get_hd()
 
         SR_new = self.SR_strategy.compute_SR(
             action=det_action,
             past_obs=self.obs,
             new_obs=new_obs,
+            state=self._state_for_prnn(
+                self._hd_for_spatial_representation(past_hd, current_hd)
+            ),
         )
 
         # --- Goal-reaching check -----------------------------------------
@@ -1295,12 +1382,12 @@ class GoalConditionedPPOAlgo(PredictivePPOAlgo):
 
         step_data = StepData(
             obs=self.obs,
-            action=action,
+            action=action.squeeze(0),
             reward=reward,
             value=value,
             SR=goal_conditioned_SR,
             dist=dist,
-            log_prob=dist.log_prob(action),
+            log_prob=self._policy_log_prob(dist, action).squeeze(0),
             loc=self.loc,
             mask=self.mask,
             reward_past=reward_past,

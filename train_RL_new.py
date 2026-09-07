@@ -136,7 +136,7 @@ class RL_Trainer(object):
 
         # Load environment
         env_key = args.exp.env_name
-        env = RLutils.make_env(
+        env = RLutils.make_minigrid_env(
                                env_key=env_key,
                                input_type=args.inputs.input_type,
                                spatial_config=args.SR,

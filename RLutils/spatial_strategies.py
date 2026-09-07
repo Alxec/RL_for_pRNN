@@ -12,6 +12,7 @@ from typing import Optional, List, Dict, Any
 
 import torch
 import numpy as np
+import gymnasium as gym
 
 from RLutils.pc import FakePlaceCells
 from prnn.utils.CANNNet import CANNnet
@@ -80,17 +81,22 @@ class PredictiveNetworkSR(SpatialRepresentationStrategy):
         self.device = device
         self.mask_indices = mask_indices
         self.pN.pRNN.to(device)
+        if hasattr(self.pN.env_shell, "encoder"):
+            self.pN.env_shell.encoder.to(device)
     
     def compute_SR(
             self,
             action: np.ndarray,
             new_obs: Dict,
+            state=None,
             **kwargs
         ) -> torch.Tensor:
         """Compute SR using standard predictive network."""
         obs_list = [new_obs, new_obs]
         
-        obs_pN, act_pN = self.pN.env_shell.env2pred(obs_list, action)
+        obs_pN, act_pN = self.pN.env_shell.env2pred(
+            obs_list, action, state=state, device=self.device
+        )
         obs_pN = obs_pN.to(self.device)
         act_pN = act_pN.to(self.device)
         
@@ -101,7 +107,21 @@ class PredictiveNetworkSR(SpatialRepresentationStrategy):
     
     def initialize_SR(self, obs: Dict) -> torch.Tensor:
         """Initialize SR for predictive network."""
-        obs_pN, act_pN = self.pN.env_shell.env2pred([obs, obs], np.array([0]))
+        action_space = self.pN.env_shell.action_space
+        initial_action = (
+            np.zeros(action_space.shape, dtype=np.float32)
+            if isinstance(action_space, gym.spaces.Box) else np.array([0])
+        )
+        state = None
+        if hasattr(self.pN.env_shell, "get_agent_dir"):
+            hd = self.pN.env_shell.get_agent_dir()
+            # The Shell expands this selected observation HD as needed by its
+            # encoder. A single value prevents mismatched HD timesteps at
+            # inference.
+            state = {"agent_dir": np.float32(hd)}
+        obs_pN, act_pN = self.pN.env_shell.env2pred(
+            [obs, obs], initial_action, state=state, device=self.device
+        )
         act_pN = torch.zeros_like(act_pN)
         obs_pN = obs_pN.to(self.device)
         act_pN = act_pN.to(self.device)
@@ -127,12 +147,15 @@ class PredictiveNetworkPastSR(PredictiveNetworkSR):
             self,
             action: np.ndarray,
             past_obs: Dict,
+            state=None,
             **kwargs
         ) -> torch.Tensor:
         """Compute SR using standard predictive network."""
         obs_list = [past_obs, past_obs]
         
-        obs_pN, act_pN = self.pN.env_shell.env2pred(obs_list, action)
+        obs_pN, act_pN = self.pN.env_shell.env2pred(
+            obs_list, action, state=state, device=self.device
+        )
         obs_pN = obs_pN.to(self.device)
         act_pN = act_pN.to(self.device)
         
@@ -144,9 +167,9 @@ class PredictiveNetworkPastSR(PredictiveNetworkSR):
     def initialize_SR(self, obs: Dict) -> torch.Tensor:
         return torch.zeros((1, self.pN.hidden_size), device=self.device)
     
-    def last_SR(self, det_action: np.ndarray, obs: Dict, **kwargs) -> torch.Tensor:
+    def last_SR(self, det_action: np.ndarray, obs: Dict, state=None, **kwargs) -> torch.Tensor:
         """Compute last SR after episode ends."""
-        return self.compute_SR(det_action, obs)
+        return self.compute_SR(det_action, obs, state=state)
 
 
 class ThetaCyclePredictiveNetworkSR(SpatialRepresentationStrategy):
