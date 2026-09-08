@@ -1113,6 +1113,35 @@ class PredictivePPOAlgo:
 # Goal-Conditioned PPO
 # ============================================================================
 
+
+def _align_goal_pool(goal_pool: Dict) -> tuple[torch.Tensor, np.ndarray]:
+    """Return goal activity and locations with one entry per candidate goal.
+
+    A standard pRNN produces one activity vector for every collected action,
+    while a Rollout pRNN has a shorter temporal horizon because its final
+    inputs lack a complete rollout window. The location trajectory still
+    contains every raw environment state. Goal filtering must therefore use
+    the pRNN activity horizon, not assume that removing its final location is
+    sufficient.
+    """
+    activity = goal_pool["h"]
+    if len(activity.shape) != 3:
+        raise ValueError(
+            "Goal-pool activity must have shape (rollout, timesteps, units); "
+            f"received {tuple(activity.shape)}."
+        )
+
+    goal_count = int(activity.shape[1])
+    locations = np.asarray(goal_pool["state"]["agent_pos"])
+    location_count = locations.shape[0] if locations.ndim else 0
+    if locations.ndim != 2 or location_count < goal_count:
+        raise ValueError(
+            "Goal-pool locations cannot be aligned with pRNN activity: "
+            f"received {location_count} locations for {goal_count} activity states."
+        )
+    return activity, locations[:goal_count]
+
+
 class GoalConditionedPPOAlgo(PredictivePPOAlgo):
     """
     Goal-conditioned extension of PredictivePPOAlgo.
@@ -1165,8 +1194,7 @@ class GoalConditionedPPOAlgo(PredictivePPOAlgo):
         """
         # Store goal pool early so _setup_experience_buffer can use it.
         # device is resolved inside super().__init__; store raw tensor for now.
-        self._goal_pool_raw = goal_pool['h']
-        self._goal_locs = goal_pool['state']['agent_pos']
+        self._goal_pool_raw, self._goal_locs = _align_goal_pool(goal_pool)
         self._video_ext = video_ext
 
         # Optionally filter out excluded goal locations.
@@ -1182,10 +1210,8 @@ class GoalConditionedPPOAlgo(PredictivePPOAlgo):
                 (int(exclude_arr[0, i]), int(exclude_arr[1, i]))
                 for i in range(exclude_arr.shape[1])
             }
-            goal_locs_arr = np.asarray(self._goal_locs)
-
             keep_mask_np = np.array(
-                [tuple(map(int, loc)) not in excluded for loc in goal_locs_arr],
+                [tuple(map(int, loc)) not in excluded for loc in self._goal_locs],
                 dtype=bool,
             )
 
@@ -1195,13 +1221,13 @@ class GoalConditionedPPOAlgo(PredictivePPOAlgo):
                     "Provide a less restrictive exclude_loactions set."
                 )
 
-            self._goal_locs = goal_locs_arr[keep_mask_np]
+            self._goal_locs = self._goal_locs[keep_mask_np]
 
             if isinstance(self._goal_pool_raw, torch.Tensor):
-                keep_mask = torch.as_tensor(keep_mask_np[:-1], device=self._goal_pool_raw.device)
+                keep_mask = torch.as_tensor(keep_mask_np, device=self._goal_pool_raw.device)
                 self._goal_pool_raw = self._goal_pool_raw[:, keep_mask]
             else:
-                self._goal_pool_raw = np.asarray(self._goal_pool_raw)[:, keep_mask_np[:-1]]
+                self._goal_pool_raw = np.asarray(self._goal_pool_raw)[:, keep_mask_np]
 
         self.goal_threshold = goal_threshold
         self.goal_strategy = goal_strategy or RandomGoalStrategy()
