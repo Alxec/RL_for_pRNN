@@ -20,6 +20,18 @@ from prnn.utils.CANNNet import CANNnet
 logger = logging.getLogger(__name__)
 
 
+def _single_step_prnn_action(action) -> np.ndarray:
+    """Adapt one environment action to the pRNN Shell action convention.
+
+    Gymnasium requires discrete actions to be Python scalars, while the pRNN
+    action encoders operate on a one-step sequence (for example ``[a_t]`` for
+    ``SpeedHD``).  Continuous Miniworld actions are already vectors and must
+    retain their ``[forward_speed, angular_displacement]`` layout.
+    """
+    action_array = np.asarray(action)
+    return action_array.reshape(1) if action_array.ndim == 0 else action_array
+
+
 # ============================================================================
 # Spatial Representation Strategies
 # ============================================================================
@@ -93,6 +105,7 @@ class PredictiveNetworkSR(SpatialRepresentationStrategy):
         ) -> torch.Tensor:
         """Compute SR using standard predictive network."""
         obs_list = [new_obs, new_obs]
+        action = _single_step_prnn_action(action)
         
         obs_pN, act_pN = self.pN.env_shell.env2pred(
             obs_list, action, state=state, device=self.device
@@ -152,6 +165,7 @@ class PredictiveNetworkPastSR(PredictiveNetworkSR):
         ) -> torch.Tensor:
         """Compute SR using standard predictive network."""
         obs_list = [past_obs, past_obs]
+        action = _single_step_prnn_action(action)
         
         obs_pN, act_pN = self.pN.env_shell.env2pred(
             obs_list, action, state=state, device=self.device
