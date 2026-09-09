@@ -1,5 +1,6 @@
 import gymnasium as gym
 import numpy as np
+from PIL import Image, ImageDraw, ImageFont
 from gymnasium import spaces
 from gymnasium.core import ObservationWrapper, Wrapper
 from gymnasium.wrappers import RecordVideo
@@ -176,6 +177,13 @@ def make_miniworld_env(
         env = MiniworldHeadDirectionObsWrapper(env, hd_bins=hd_bins)
 
     if vid_n_episodes:
+        # Insert this below RecordVideo so it changes only rendered frames,
+        # never the observation delivered to the actor-critic.
+        env = MiniworldVideoInfoOverlayWrapper(
+            env,
+            hd_bins=hd_bins,
+            ac_receives_hd=with_HD,
+        )
         trigger_func = partial(episode_video_trigger, vid_n_episodes=vid_n_episodes)
         env = RecordVideo(env, video_folder=vid_folder, episode_trigger=trigger_func)
 
@@ -265,3 +273,90 @@ class MiniworldHeadDirectionObsWrapper(ObservationWrapper):
         hd = float(self.env.unwrapped.agent.dir) % (2 * np.pi)
         hd_bin = min(int(hd / (2 * np.pi) * self.hd_bins), self.hd_bins - 1)
         return {"image": obs, "HD": hd_bin}
+
+
+class MiniworldVideoInfoOverlayWrapper(Wrapper):
+    """Add agent-state metadata beside rendered Miniworld video frames.
+
+    This is deliberately a rendering-only wrapper.  It is installed below
+    Gymnasium's :class:`RecordVideo`, after any visual/HD observation wrappers,
+    so it does not alter the image or HD bin received by the actor-critic.
+    """
+
+    display_scale = 3
+    panel_width = 260
+
+    def __init__(self, env, *, hd_bins, ac_receives_hd):
+        super().__init__(env)
+        self.hd_bins = int(hd_bins)
+        self.ac_receives_hd = bool(ac_receives_hd)
+        if self.hd_bins < 1:
+            raise ValueError("hd_bins must be at least one.")
+
+    def info_lines(self):
+        """Return the values shown in the side panel for the current frame."""
+        agent = getattr(self.env.unwrapped, "agent", None)
+        position = getattr(agent, "pos", None)
+        direction = getattr(agent, "dir", None)
+
+        if position is None:
+            position_text = "Agent position: unavailable"
+        else:
+            position = np.asarray(position, dtype=np.float64).reshape(-1)
+            if position.size >= 2:
+                position_text = f"Agent position: ({position[0]:.2f}, {position[1]:.2f})"
+            else:
+                position_text = "Agent position: unavailable"
+
+        if direction is None:
+            direction_text = "Agent direction: unavailable"
+            hd_text = "AC HD bin: unavailable" if self.ac_receives_hd else "AC HD bin: not provided"
+        else:
+            direction = float(direction) % (2 * np.pi)
+            direction_text = (
+                f"Agent direction: {direction:.3f} rad ({np.degrees(direction):.1f} deg)"
+            )
+            if self.ac_receives_hd:
+                hd_bin = min(int(direction / (2 * np.pi) * self.hd_bins), self.hd_bins - 1)
+                hd_text = f"AC HD bin: {hd_bin} / {self.hd_bins - 1}"
+            else:
+                hd_text = "AC HD bin: not provided"
+
+        return (position_text, direction_text, hd_text)
+
+    @staticmethod
+    def _font():
+        try:
+            return ImageFont.truetype("DejaVuSans.ttf", 16)
+        except OSError:
+            return ImageFont.load_default()
+
+    def render(self):
+        frame = self.env.render()
+        if frame is None:
+            return None
+
+        frame_array = np.asarray(frame)
+        if frame_array.ndim != 3 or frame_array.shape[-1] < 3:
+            raise ValueError("Miniworld video rendering must produce an RGB frame.")
+        frame_array = np.asarray(frame_array[..., :3], dtype=np.uint8)
+
+        image = Image.fromarray(frame_array)
+        resampling = getattr(Image, "Resampling", Image).NEAREST
+        image = image.resize(
+            (image.width * self.display_scale, image.height * self.display_scale),
+            resample=resampling,
+        )
+        canvas = Image.new(
+            "RGB",
+            (image.width + self.panel_width, max(image.height, 112)),
+            color=(24, 28, 34),
+        )
+        canvas.paste(image, (0, 0))
+        draw = ImageDraw.Draw(canvas)
+        font = self._font()
+        x = image.width + 14
+        draw.text((x, 14), "Miniworld agent", fill=(240, 240, 240), font=font)
+        for line_index, line in enumerate(self.info_lines(), start=1):
+            draw.text((x, 14 + line_index * 25), line, fill=(196, 220, 255), font=font)
+        return np.asarray(canvas)
