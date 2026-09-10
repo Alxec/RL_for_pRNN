@@ -234,7 +234,20 @@ class HDObsWrapper(ObservationWrapper):
 
 
 class MiniworldFullyObservableWrapper(ObservationWrapper):
-    """Replace Miniworld's agent-view observation with its top-down RGB view."""
+    """Replace Miniworld's agent view with an annotated top-down RGB view.
+
+    The top-down camera is used only as a fully-observable RL baseline.  Its
+    renderer depicts the ``Rat`` agent as a very small red triangle, which is
+    easy for a convolutional policy to lose amongst the maze texture.  This
+    wrapper therefore draws a two-times-larger directional marker and
+    brightens a 60-degree cone matching the agent camera's field of view.
+    Neither annotation changes the Miniworld state or agent-view (PO)
+    observations.
+    """
+
+    agent_marker_scale = 2.0
+    cone_brightness = 1.35
+    cone_map_fraction = 0.30
 
     def __init__(self, env):
         super().__init__(env)
@@ -247,8 +260,113 @@ class MiniworldFullyObservableWrapper(ObservationWrapper):
             dtype=env.observation_space.dtype,
         )
 
+    @staticmethod
+    def _world_to_pixel(point, scale):
+        """Project an ``(x, _, z)`` Miniworld coordinate into the top view."""
+        return np.array([
+            point[0] * scale["x_scale"] + scale["x_offset"],
+            point[2] * scale["z_scale"] + scale["z_offset"],
+        ])
+
+    @staticmethod
+    def _triangle_mask(image_shape, vertices):
+        """Return the filled-triangle mask for pixel-space ``(x, y)`` vertices."""
+        height, width = image_shape[:2]
+        min_x = max(0, int(np.floor(vertices[:, 0].min())))
+        max_x = min(width - 1, int(np.ceil(vertices[:, 0].max())))
+        min_y = max(0, int(np.floor(vertices[:, 1].min())))
+        max_y = min(height - 1, int(np.ceil(vertices[:, 1].max())))
+
+        mask = np.zeros((height, width), dtype=bool)
+        if min_x > max_x or min_y > max_y:
+            return mask
+
+        xs, ys = np.meshgrid(
+            np.arange(min_x, max_x + 1), np.arange(min_y, max_y + 1)
+        )
+        points = np.stack((xs, ys), axis=-1)
+
+        def edge(start, end):
+            return (
+                (end[0] - start[0]) * (points[..., 1] - start[1])
+                - (end[1] - start[1]) * (points[..., 0] - start[0])
+            )
+
+        edges = (edge(vertices[0], vertices[1]),
+                 edge(vertices[1], vertices[2]),
+                 edge(vertices[2], vertices[0]))
+        inside = (
+            np.logical_and.reduce([edge >= 0 for edge in edges])
+            | np.logical_and.reduce([edge <= 0 for edge in edges])
+        )
+        mask[min_y:max_y + 1, min_x:max_x + 1] = inside
+        return mask
+
+    def _cone_mask(self, image, scale, position, direction, fov_degrees):
+        """Build a finite top-down camera-FOV cone in world coordinates."""
+        height, width = image.shape[:2]
+        xs, zs = np.meshgrid(np.arange(width), np.arange(height))
+        world_x = (xs - scale["x_offset"]) / scale["x_scale"]
+        world_z = (zs - scale["z_offset"]) / scale["z_scale"]
+        displacement = np.stack((world_x - position[0], world_z - position[2]), axis=-1)
+        distance = np.linalg.norm(displacement, axis=-1)
+
+        visible_width = width / scale["x_scale"]
+        visible_height = height / scale["z_scale"]
+        cone_length = self.cone_map_fraction * min(visible_width, visible_height)
+        forward_dot = displacement[..., 0] * direction[0] + displacement[..., 1] * direction[1]
+        with np.errstate(invalid="ignore", divide="ignore"):
+            cosine = forward_dot / distance
+        half_fov = np.deg2rad(fov_degrees) / 2
+        return (
+            (distance > 0)
+            & (distance <= cone_length)
+            & (cosine >= np.cos(half_fov))
+        )
+
+    def _agent_marker(self, position, direction, scale):
+        """Return the pixel-space vertices of a doubled Miniworld Rat marker."""
+        # ``Rat.render`` uses a tip 0.5 world units ahead and base vertices
+        # 0.375 units behind/aside.  Reusing that geometry keeps the overlay
+        # aligned with the renderer while making it exactly twice as large.
+        right = np.array([-direction[1], direction[0]])
+        marker_scale = self.agent_marker_scale
+        tip = position + marker_scale * 0.5 * direction
+        base_left = position + marker_scale * 0.375 * (-direction + right)
+        base_right = position + marker_scale * 0.375 * (-direction - right)
+
+        def to_pixel(point):
+            return self._world_to_pixel(
+                np.array([point[0], 0.0, point[1]]), scale
+            )
+
+        return np.stack((to_pixel(tip), to_pixel(base_left), to_pixel(base_right)))
+
     def observation(self, _obs):
-        return self.env.unwrapped.render_top_view()
+        image, scale = self.env.unwrapped.render_top_view(return_scale=True)
+        image = image.copy()
+        agent = self.env.unwrapped.agent
+        position = np.asarray(agent.pos, dtype=float)
+        direction_3d = np.asarray(agent.dir_vec, dtype=float)
+        direction = np.array((direction_3d[0], direction_3d[2]))
+        direction /= np.linalg.norm(direction)
+
+        cone = self._cone_mask(
+            image,
+            scale,
+            position,
+            direction,
+            fov_degrees=float(agent.cam_fov_y),
+        )
+        image[cone] = np.clip(
+            image[cone].astype(np.float32) * self.cone_brightness, 0, 255
+        ).astype(image.dtype)
+
+        marker = self._triangle_mask(
+            image.shape, self._agent_marker(position[[0, 2]], direction, scale)
+        )
+        image[marker] = np.array((255, 0, 0), dtype=image.dtype)
+        return image
 
 
 class MiniworldHeadDirectionObsWrapper(ObservationWrapper):
