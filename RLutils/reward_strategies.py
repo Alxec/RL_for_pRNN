@@ -68,6 +68,60 @@ class RandomGoalStrategy(GoalSelectionStrategy):
         return goal_pool[:, idx], idx
 
 
+class RandomLocationGoalStrategy(GoalSelectionStrategy):
+    """Select a location goal and encode its x and y coordinates separately.
+
+    The location-goal PPO baseline deliberately does not depend on a pRNN
+    representation.  A candidate is an integer ``(x, y)`` environment
+    position, represented to the policy as ``onehot(x) || onehot(y)``.  This
+    preserves the factorisation of a grid location while making each goal
+    coordinate explicit to an otherwise visual actor-critic.
+    """
+
+    def __init__(self, width: int, height: int, device: torch.device):
+        if width <= 0 or height <= 0:
+            raise ValueError("Location-goal dimensions must both be positive.")
+        self.width = int(width)
+        self.height = int(height)
+        self.device = device
+
+    @property
+    def goal_size(self) -> int:
+        return self.width + self.height
+
+    def encode_location(self, location) -> torch.Tensor:
+        """Return a batch-one ``onehot(x) || onehot(y)`` goal tensor."""
+        location = np.asarray(location)
+        if location.shape != (2,):
+            raise ValueError(
+                "A location goal must have exactly two coordinates (x, y); "
+                f"received shape {location.shape}."
+            )
+        rounded = np.rint(location).astype(int)
+        if not np.allclose(location, rounded):
+            raise ValueError(
+                f"Location goals must use integer grid coordinates; got {location}."
+            )
+        x, y = rounded
+        if not (0 <= x < self.width and 0 <= y < self.height):
+            raise ValueError(
+                f"Goal {(x, y)} is outside the {self.width}x{self.height} grid."
+            )
+        goal = torch.zeros((1, self.goal_size), dtype=torch.float32, device=self.device)
+        goal[0, x] = 1.0
+        goal[0, self.width + y] = 1.0
+        return goal
+
+    def select_goal(self, goal_pool) -> tuple[torch.Tensor, int]:
+        locations = np.asarray(goal_pool)
+        if locations.ndim != 2 or locations.shape[1] != 2 or len(locations) == 0:
+            raise ValueError(
+                "Location goal pool must have shape (num_goals, 2) with at least one goal."
+            )
+        idx = torch.randint(len(locations), (1,)).item()
+        return self.encode_location(locations[idx]), idx
+
+
 class InternalRewardStrategy(RewardStrategy):
     """Compute internal rewards based on spatial representation similarity."""
     

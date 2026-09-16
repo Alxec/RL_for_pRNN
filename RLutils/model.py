@@ -196,6 +196,63 @@ class ACModel(nn.Module, torch_ac.ACModel):
         return dist, value
 
 
+class ACModelLocationGoal(ACModel):
+    """Visual discrete-action actor-critic conditioned on a grid location.
+
+    ``goal`` is the factorised location encoding
+    ``onehot(goal_x) || onehot(goal_y)``.  Keeping it distinct from ``SR``
+    prevents visual goal baselines from inheriting pRNN-specific assumptions.
+    """
+
+    def __init__(
+            self,
+            obs_space,
+            action_space,
+            goal_shape: tuple[int, int],
+            with_HD=True,
+            rgb=True,
+    ):
+        width, height = goal_shape
+        if width <= 0 or height <= 0:
+            raise ValueError("Location-goal dimensions must both be positive.")
+        self.goal_shape = (int(width), int(height))
+        self.goal_size = sum(self.goal_shape)
+        super().__init__(obs_space, action_space, with_HD=with_HD, rgb=rgb)
+
+    @property
+    def embedding_size(self):
+        visual_size = self.image_embedding_size + (4 if self.with_HD else 0)
+        return visual_size + self.goal_size
+
+    def forward(self, obs, goal, **kwargs):
+        if goal.ndim != 2 or goal.shape[1] != self.goal_size:
+            raise ValueError(
+                "Location goal must have shape (batch, width + height) = "
+                f"(batch, {self.goal_size}); received {tuple(goal.shape)}."
+            )
+        if goal.shape[0] != obs.image.shape[0]:
+            raise ValueError(
+                "Location-goal batch size must match the observation batch size."
+            )
+
+        x = obs.image.transpose(1, 3).transpose(2, 3)
+        if self.rgb:
+            x /= 255
+        x = self.image_conv(x)
+        x = x.reshape(x.shape[0], -1)
+
+        if self.with_HD:
+            onehot_HD = F.one_hot(obs.direction.long(), num_classes=4).float()
+            embedding = torch.cat((x, onehot_HD, goal), dim=1)
+        else:
+            embedding = torch.cat((x, goal), dim=1)
+
+        logits = self.actor(embedding)
+        dist = Categorical(logits=F.log_softmax(logits, dim=1))
+        value = self.critic(embedding).squeeze(1)
+        return dist, value
+
+
 class ACModelSR(ACModel):
     """Primary actor-critic model operating on a spatial representation.
 

@@ -20,8 +20,9 @@ from .reward_strategies import (
     CuriousRewardStrategy,
     GoalSelectionStrategy,
     RandomGoalStrategy,
+    RandomLocationGoalStrategy,
 )
-from .spatial_strategies import create_spatial_representation_strategy
+from .spatial_strategies import NoSpatialRepresentation, create_spatial_representation_strategy
 from .other import synthesize
 from .analysis import mutual_info_policy
 from RLutils.goal_video_recorder import GoalMarkedVideoRecorder
@@ -1520,3 +1521,324 @@ class GoalConditionedPPOAlgo(PredictivePPOAlgo):
                 last_actions=self.experience_buffer.last_actions,
             )
             self.experience_buffer.store_rewards("curious", curious_rewards)
+
+
+# ============================================================================
+# Visual Location-Goal PPO
+# ============================================================================
+
+
+class VisualGoalConditionedPPOAlgo(PredictivePPOAlgo):
+    """Goal-conditioned PPO for visual baselines without a pRNN input.
+
+    A goal is an integer grid location sampled from a pre-collected pool. The
+    actor-critic receives the visual observation and a separate
+    ``onehot(goal_x) || onehot(goal_y)`` input. Reaching the selected location
+    terminates the episode and adds a terminal reward of one. This intentionally
+    remains independent of ``GoalConditionedPPOAlgo``, whose goal, experience
+    buffer, and reward semantics are defined in pRNN spatial-representation
+    space.
+    """
+
+    def __init__(
+        self,
+        env,
+        acmodel: torch.nn.Module,
+        ppo_config: DictConfig,
+        spatial_config: DictConfig,
+        reward_config: DictConfig,
+        goal_pool,
+        goal_strategy: Optional[GoalSelectionStrategy] = None,
+        exclude_locations: Optional[np.ndarray] = None,
+        video_log_freq: Optional[int] = None,
+        video_folder: Optional[str] = None,
+        video_ext: str = "",
+        device: Optional[torch.device] = None,
+        preprocess_obss=None,
+    ):
+        self.goal_width = int(env.width)
+        self.goal_height = int(env.height)
+        self.goal_size = self.goal_width + self.goal_height
+        self._goal_pool_raw = self._validate_location_pool(goal_pool)
+        self._goal_pool_raw = self._exclude_locations(
+            self._goal_pool_raw, exclude_locations
+        )
+        self.goal_strategy = goal_strategy or RandomLocationGoalStrategy(
+            self.goal_width, self.goal_height, device or torch.device("cpu")
+        )
+        self.video_log_freq = int(video_log_freq) if video_log_freq is not None else 0
+        self.video_folder = video_folder
+        self._video_ext = video_ext
+        self._video_recorder = None
+        self._episode_counter = 0
+
+        if self.video_log_freq < 0:
+            raise ValueError("video_log_freq must be >= 0")
+        if self.video_log_freq > 0:
+            if not self.video_folder:
+                raise ValueError(
+                    "video_folder must be provided when video_log_freq is enabled"
+                )
+            os.makedirs(self.video_folder, exist_ok=True)
+
+        super().__init__(
+            env=env,
+            acmodel=acmodel,
+            predictiveNet=None,
+            ppo_config=ppo_config,
+            spatial_config=spatial_config,
+            reward_config=reward_config,
+            device=device,
+            preprocess_obss=preprocess_obss,
+            joint_probabilities=False,
+        )
+
+        if getattr(self.acmodel, "goal_size", self.goal_size) != self.goal_size:
+            raise ValueError(
+                "Actor-critic location-goal input size does not match the environment: "
+                f"expected {self.goal_size}."
+            )
+        self.goal_pool = self._goal_pool_raw
+        self.experience_buffer = ExperienceBuffer(
+            num_frames=self.config.num_frames,
+            SR_size=self.goal_size,
+            device=self.device,
+            action_space=self.env.action_space,
+        )
+        self._select_goal()
+        logger.info("VisualGoalConditionedPPOAlgo initialised")
+
+    def _validate_config(self):
+        """Validate the non-pRNN, discrete location-goal requirements."""
+        assert self.acmodel.recurrent or self.config.recurrence == 1, (
+            "Non-recurrent model requires recurrence=1"
+        )
+        assert self.config.num_frames % self.config.recurrence == 0, (
+            "num_frames must be divisible by recurrence"
+        )
+        assert self.config.batch_size % self.config.recurrence == 0, (
+            "batch_size must be divisible by recurrence"
+        )
+        if self.continuous_actions:
+            raise ValueError(
+                "Visual location-goal PPO currently requires a discrete action space."
+            )
+        if self.reward_config.internal_enabled:
+            raise ValueError(
+                "Visual location-goal PPO uses exact location rewards; "
+                "set rewards.internal_enabled=false."
+            )
+        if self.reward_config.curious_enabled:
+            raise ValueError(
+                "Visual location-goal PPO has no predictive network; "
+                "set rewards.curious_enabled=false."
+            )
+
+    def _setup_reward_strategies(self):
+        """Location goals use only environment reward plus the terminal bonus."""
+        self.all_rewards = []
+        self.rewards = torch.tensor([], device=self.device)
+        self.all_rewards.append(self.rewards)
+        self.internal_strategy = None
+        self.internal_rewards = None
+        self.curious_strategy = None
+        self.curious_rewards = None
+
+    def _setup_spatial_representation(self):
+        """Keep the base PPO bookkeeping SR-free for this visual baseline."""
+        self.SR_strategy = NoSpatialRepresentation(self.device)
+        self.SR = self.SR_strategy.initialize_SR(obs=self.obs)
+
+    def _validate_location_pool(self, goal_pool) -> np.ndarray:
+        locations = np.asarray(goal_pool)
+        if locations.ndim != 2 or locations.shape[1] != 2 or len(locations) == 0:
+            raise ValueError(
+                "Location goal pool must have shape (num_goals, 2) with at least one goal."
+            )
+        rounded = np.rint(locations).astype(int)
+        if not np.allclose(locations, rounded):
+            raise ValueError("Location goal pools must contain integer grid coordinates.")
+        in_bounds = (
+            (rounded[:, 0] >= 0)
+            & (rounded[:, 0] < self.goal_width)
+            & (rounded[:, 1] >= 0)
+            & (rounded[:, 1] < self.goal_height)
+        )
+        if not in_bounds.all():
+            raise ValueError("Location goal pool contains coordinates outside the environment grid.")
+        return rounded
+
+    @staticmethod
+    def _exclude_locations(
+        locations: np.ndarray, exclude_locations: Optional[np.ndarray]
+    ) -> np.ndarray:
+        if exclude_locations is None:
+            return locations
+        excluded_array = np.asarray(exclude_locations)
+        if excluded_array.ndim != 2 or excluded_array.shape[0] != 2:
+            raise ValueError(
+                "exclude_locations must have shape (2, num_locations)."
+            )
+        excluded = {tuple(location) for location in excluded_array.T.astype(int)}
+        selected = np.asarray(
+            [location for location in locations if tuple(location) not in excluded],
+            dtype=int,
+        )
+        if len(selected) == 0:
+            raise ValueError("All collected location goals were excluded.")
+        return selected
+
+    def _select_goal(self) -> torch.Tensor:
+        self.goal, idx = self.goal_strategy.select_goal(self.goal_pool)
+        self.goal = self.goal.to(self.device)
+        self.goal_loc = self.goal_pool[idx].copy()
+        return self.goal
+
+    def _set_new_goal(self) -> None:
+        self._select_goal()
+        logger.debug("New visual location goal selected")
+
+    def _should_record_current_episode(self) -> bool:
+        return self.video_log_freq > 0 and self._episode_counter % self.video_log_freq == 0
+
+    def _ensure_episode_video_recorder(self) -> None:
+        if self._video_recorder is not None or not self._should_record_current_episode():
+            return
+        base_path = os.path.join(
+            self.video_folder,
+            f"goal_episode_{self._episode_counter:07d}_{self._video_ext}",
+        )
+        self._video_recorder = GoalMarkedVideoRecorder(
+            env=self.env.env,
+            base_path=base_path,
+            goal_location=self.goal_loc,
+            enabled=True,
+            disable_logger=True,
+        )
+        self._video_recorder.capture_frame()
+
+    def _stop_episode_video_recorder(self) -> None:
+        if self._video_recorder is None:
+            return
+        try:
+            self._video_recorder.close()
+        finally:
+            self._video_recorder = None
+
+    def _compute_goal_start_distance(self) -> float:
+        return float(
+            np.linalg.norm(
+                np.asarray(self._get_agent_pos(), dtype=np.float32)
+                - np.asarray(self.goal_loc, dtype=np.float32)
+            )
+        )
+
+    def _check_goal(self, location) -> tuple[float, bool]:
+        reached = bool(np.array_equal(np.asarray(location, dtype=int), self.goal_loc))
+        return (1.0, True) if reached else (0.0, False)
+
+    def _select_action(self) -> Tuple[torch.Tensor, Any, torch.Tensor, np.ndarray]:
+        preprocessed_obs = self.preprocess_obss([self.obs], device=self.device)
+        with torch.no_grad():
+            dist, value = self.acmodel(preprocessed_obs, goal=self.goal)
+        action = dist.sample()
+        return action, dist, value, self._environment_action(action)
+
+    def _collect_single_step(self, idx: int) -> Tuple[StepData, bool]:
+        self._ensure_episode_video_recorder()
+        action, dist, value, det_action = self._select_action()
+        new_obs, reward, terminated, truncated, _ = self.env.step(det_action)
+        if self._video_recorder is not None:
+            self._video_recorder.capture_frame()
+
+        if self.reward_config.exploration:
+            reward, terminated, truncated = 0, False, False
+        done = terminated or truncated
+        new_loc = self._get_agent_pos()
+        goal_reward, goal_reached = self._check_goal(new_loc)
+        reward += goal_reward
+        done = done or goal_reached
+        if goal_reached:
+            self._episode_goal_reached = True
+
+        step_data = StepData(
+            obs=self.obs,
+            action=action.squeeze(0),
+            reward=reward,
+            value=value,
+            SR=self.goal,
+            dist=dist,
+            log_prob=self._policy_log_prob(dist, action).squeeze(0),
+            loc=self.loc,
+            mask=self.mask,
+        )
+        self.obs = new_obs
+        self.loc = new_loc
+        self.mask = 1 - done
+        return step_data, done
+
+    def _handle_episode_end(self, idx: int) -> None:
+        if self._current_episode_start_distance is not None:
+            if self._episode_goal_reached:
+                self._distances_success.append(self._current_episode_start_distance)
+            else:
+                self._distances_fail.append(self._current_episode_start_distance)
+        self._stop_episode_video_recorder()
+        super()._handle_episode_end(idx)
+        self._set_new_goal()
+        self.loc = self._get_agent_pos()
+        self._current_episode_start_distance = self._compute_goal_start_distance()
+        self._episode_goal_reached = False
+        self._episode_counter += 1
+
+    def collect_experiences(self) -> DictList:
+        self._distances_success = []
+        self._distances_fail = []
+        self._episode_goal_reached = False
+        self._stop_episode_video_recorder()
+        self._set_new_goal()
+        self._current_episode_start_distance = self._compute_goal_start_distance()
+        try:
+            exps = super().collect_experiences()
+        finally:
+            self._stop_episode_video_recorder()
+        self._logs_collect["distances_success"] = self._distances_success
+        self._logs_collect["distances_fail"] = self._distances_fail
+        return exps
+
+    def _compute_augmented_rewards(self) -> None:
+        """There are no pRNN-derived rewards in a visual location baseline."""
+
+    def _compute_ppo_loss(self, sb) -> Tuple[torch.Tensor, Dict]:
+        dist, value = self.acmodel(sb.obs, goal=sb.SR)
+        policy_entropy = dist.entropy().mean()
+        ratio = torch.exp(self._policy_log_prob(dist, sb.action) - sb.log_prob)
+        policy_loss = -torch.min(
+            ratio * sb.advantage,
+            torch.clamp(ratio, 1.0 - self.config.clip_eps, 1.0 + self.config.clip_eps)
+            * sb.advantage,
+        ).mean()
+        value_clipped = sb.value + torch.clamp(
+            value - sb.value, -self.config.clip_eps, self.config.clip_eps
+        )
+        value_loss = torch.max(
+            (value - sb.returnn).pow(2), (value_clipped - sb.returnn).pow(2)
+        ).mean()
+        if self.policy_prior is not None:
+            prior = self.policy_prior.unsqueeze(0).expand(dist.probs.shape[0], -1)
+            prior_kl = kl_divergence(dist, Categorical(probs=prior)).mean()
+        else:
+            prior_kl = torch.tensor(0.0, device=self.device)
+        loss = (
+            policy_loss
+            - self.config.entropy_coef * policy_entropy
+            + self.config.value_loss_coef * value_loss
+            + self.prior_kl_coef * prior_kl
+        )
+        return loss, {
+            "entropy": policy_entropy.item() / torch.log(torch.tensor(2.0)),
+            "value": value.mean().item(),
+            "policy_loss": policy_loss.item(),
+            "value_loss": value_loss.item(),
+            "prior_kl": prior_kl.item(),
+        }
