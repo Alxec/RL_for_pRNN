@@ -175,7 +175,7 @@ class InternalRewardStrategy(RewardStrategy):
             [cosine(SR, ref_cpu) for SR in SRs_cpu], 
             device=self.device
         )
-        errors = torch.cat((errors[0][None], errors), dim=0)
+        # errors = torch.cat((errors[0][None], errors), dim=0)
         
         # Internal reward is decrease in error
         internal_rewards = errors[:-1] - errors[1:]
