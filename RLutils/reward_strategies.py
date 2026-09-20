@@ -146,43 +146,63 @@ class InternalRewardStrategy(RewardStrategy):
     def compute_rewards(
             self,
             SRs: torch.Tensor,
+            next_SRs: torch.Tensor | None = None,
             episode_end_indices: Iterable[int] | None = None,
         ) -> torch.Tensor:
         """
         Compute internal rewards based on cosine distance to reference SR.
         
         Args:
-            SRs: Spatial representations [num_frames, SR_dim]
+            SRs: Spatial representations at the start of each action
+                [num_frames, SR_dim].
+            next_SRs: Optional representations reached by those actions,
+                with the same shape as ``SRs``.  When supplied, reward ``t``
+                is exactly ``E(SRs[t]) - E(next_SRs[t])``.  This is the PPO
+                path: it retains the last action and contains no cross-episode
+                transition.
             episode_end_indices: Positions in ``SRs`` that end an episode.
-                When provided, the reward delta from that terminal state to
-                the first state of the next episode is zeroed.
+                Used only for the legacy one-sequence form, where the
+                terminal-to-reset delta is zeroed at the terminal index.
         
         Returns:
-            Internal rewards [num_frames]
+            One reward per supplied action when ``next_SRs`` is provided;
+            otherwise one reward per adjacent pair in ``SRs``.
         """
         if not any(self.ref[0]):
-            return self.rewards
-        
-        SRs_cpu = SRs.cpu()
-        ref_cpu = self.ref.squeeze().cpu()
+            return torch.zeros(SRs.shape[0], device=self.device)
+
+        SRs_cpu = SRs.detach().cpu().clone()
+        ref_cpu = self.ref.squeeze().detach().cpu().clone()
+        next_SRs_cpu = None
+        if next_SRs is not None:
+            if next_SRs.shape != SRs.shape:
+                raise ValueError(
+                    "next_SRs must have the same shape as SRs; received "
+                    f"{tuple(next_SRs.shape)} and {tuple(SRs.shape)}."
+                )
+            next_SRs_cpu = next_SRs.detach().cpu().clone()
 
         if self.mask_internal:
             SRs_cpu[:, self.mask_indices] = 0
+            if next_SRs_cpu is not None:
+                next_SRs_cpu[:, self.mask_indices] = 0
             ref_cpu[self.mask_indices] = 0
         
         # Compute errors for all timesteps
-        errors = torch.tensor(
-            [cosine(SR, ref_cpu) for SR in SRs_cpu], 
-            device=self.device
-        )
-        # errors = torch.cat((errors[0][None], errors), dim=0)
-        
-        # Internal reward is decrease in error
+        errors = torch.tensor([cosine(SR, ref_cpu) for SR in SRs_cpu], device=self.device)
+        if next_SRs_cpu is not None:
+            next_errors = torch.tensor(
+                [cosine(SR, ref_cpu) for SR in next_SRs_cpu], device=self.device
+            )
+            return self.k_int * (errors - next_errors)
+
+        # Legacy state-sequence form.  Callers that need one reward per PPO
+        # action must supply explicit successors above.
         internal_rewards = errors[:-1] - errors[1:]
         if episode_end_indices is not None:
             cross_episode_indices = [
-                index + 1 for index in episode_end_indices
-                if index + 1 < len(internal_rewards)
+                index for index in episode_end_indices
+                if index < len(internal_rewards)
             ]
             if cross_episode_indices:
                 internal_rewards[cross_episode_indices] = 0

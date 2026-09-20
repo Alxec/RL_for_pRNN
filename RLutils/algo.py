@@ -47,6 +47,10 @@ class StepData:
     loc: Tuple[int, int]
     mask: float
     reward_past: Optional[float] = None  # reward credited to the *previous* step
+    # Raw pRNN state produced by this action.  It is deliberately separate
+    # from ``SR``: goal-conditioned PPO stores ``SR || goal`` in ``SR`` for
+    # the actor, whereas intrinsic rewards always operate on raw pRNN states.
+    SR_next: Optional[torch.Tensor] = None
 
 
 class ExperienceBuffer:
@@ -75,6 +79,10 @@ class ExperienceBuffer:
             self.actions = torch.zeros(num_frames, device=device, dtype=torch.int)
         self.values = torch.zeros(num_frames, device=device)
         self.SRs = torch.zeros((num_frames, SR_size), device=device)
+        # ``post_SRs[t]`` is the raw pRNN state produced after action ``t``.
+        # A list permits goal-conditioned PPO to store an actor input of a
+        # different dimensionality in ``SRs`` while retaining raw states here.
+        self.post_SRs = [None] * num_frames
         self.rewards = torch.zeros(num_frames, device=device)
         self.advantages = torch.zeros(num_frames, device=device)
         self.log_probs = torch.zeros(num_frames, device=device)
@@ -88,12 +96,18 @@ class ExperienceBuffer:
         # zero placeholder.  Keep the actual SR from the preceding terminal
         # action so intrinsic rewards can retain the within-episode transition.
         self.past_SR_terminal_states = {}
+        # For past-SR models, the successor of a terminal action needs one
+        # additional pRNN evaluation at the terminal observation.  Recording
+        # it by action index prevents a terminal-to-reset pair from existing.
+        self.terminal_SR_successors = {}
     
     def store_step(self, idx: int, step_data: StepData):
         """Store data from a single step."""
         self.obss[idx] = step_data.obs
         self.locs[idx] = step_data.loc
         self.SRs[idx] = step_data.SR
+        if step_data.SR_next is not None:
+            self.post_SRs[idx] = step_data.SR_next.detach().clone()
         self.masks[idx] = step_data.mask
         self.actions[idx] = step_data.action
         self.values[idx] = step_data.value
@@ -112,6 +126,7 @@ class ExperienceBuffer:
             obs: Dict,
             act: np.ndarray,
             past_SR_terminal_state: torch.Tensor | None = None,
+            terminal_SR_successor: torch.Tensor | None = None,
         ):
         """Mark trajectory end for pRNN training."""
         self.done_indices.append(idx + 1)
@@ -119,6 +134,8 @@ class ExperienceBuffer:
         self.last_actions.append(act)
         if past_SR_terminal_state is not None:
             self.past_SR_terminal_states[idx] = past_SR_terminal_state.detach().clone()
+        if terminal_SR_successor is not None:
+            self.terminal_SR_successors[idx] = terminal_SR_successor.detach().clone()
 
     def reset_trajectories(self):
         """Reset trajectory tracking."""
@@ -126,6 +143,7 @@ class ExperienceBuffer:
         self.last_observations = []
         self.last_actions = []
         self.past_SR_terminal_states = {}
+        self.terminal_SR_successors = {}
     
     def compute_advantages(
             self,
@@ -565,6 +583,7 @@ class PredictivePPOAlgo:
             log_prob=self._policy_log_prob(dist, action).squeeze(0),
             loc=self.loc,
             mask=self.mask,
+            SR_next=SR_new,
         )
         
         # Update state
@@ -580,25 +599,37 @@ class PredictivePPOAlgo:
 
         _, _, _, det_action = self._select_action()
 
-        # Update internal reference if applicable
-        if self.internal_strategy and self.experience_buffer.rewards[idx] > 1e-5:
-            SR = self.SR_strategy.last_SR(
+        terminal_successor = None
+        if self.spatial_config.past_SR and self.spatial_config.predictive_net:
+            # The normal pRNN state at index ``idx`` represents the terminal
+            # observation.  One extra, within-episode state supplies the
+            # successor needed for the terminal action's intrinsic reward.
+            terminal_successor = self.SR_strategy.last_SR(
                 SR=self.SR,
                 det_action=det_action,
                 obs=self.obs,
                 state=self._state_for_prnn(),
             )
-            self.internal_strategy.update_reference(SR)
+
+        # Update internal reference if applicable
+        if self.internal_strategy and self.experience_buffer.rewards[idx] > 1e-5:
+            self.internal_strategy.update_reference(
+                terminal_successor if terminal_successor is not None else self.SR
+            )
         
         # Record episode metrics
         self.metrics.episode_done()
         terminal_state = None
-        if self.spatial_config.past_SR:
+        if self.spatial_config.past_SR and self.spatial_config.predictive_net:
             # ``self.SR`` is the state produced by the terminal action.  It is
             # replaced by a zero placeholder for the next episode below.
             terminal_state = self.SR.squeeze(0)
         self.experience_buffer.add_traj_end(
-            idx, self.obs, det_action, past_SR_terminal_state=terminal_state
+            idx,
+            self.obs,
+            det_action,
+            past_SR_terminal_state=terminal_state,
+            terminal_SR_successor=terminal_successor,
         )
         
         # Reset environment and SR
@@ -619,23 +650,11 @@ class PredictivePPOAlgo:
         """
         # Internal rewards
         if self.internal_strategy:
-            if self.spatial_config.past_SR:
-                # Need additional SR computation for last state
-                _, _, _, det_action = self._select_action()
-                SR_last = self.SR_strategy.last_SR(
-                    SR=self.SR,
-                    det_action=det_action,
-                    obs=self.obs,
-                    state=self._state_for_prnn(),
-                )
-                SRs_all = torch.cat((self.experience_buffer.SRs[1:], SR_last), dim=0)
-                SRs_all = self._substitute_past_SR_terminal_states(SRs_all)
-                episode_end_indices = self.experience_buffer.past_SR_terminal_states.keys()
-            else:
-                SRs_all = self.experience_buffer.SRs
-                episode_end_indices = None
+            SRs_all, next_SRs = self._internal_reward_state_pairs(
+                self.experience_buffer.SRs
+            )
             internal_rewards = self.internal_strategy.compute_rewards(
-                SRs=SRs_all, episode_end_indices=episode_end_indices
+                SRs=SRs_all, next_SRs=next_SRs
             )
             
             self.experience_buffer.store_rewards('internal', internal_rewards)
@@ -653,6 +672,60 @@ class PredictivePPOAlgo:
                 last_actions=self.experience_buffer.last_actions
             )
             self.experience_buffer.store_rewards('curious', curious_rewards)
+
+    def _post_action_SRs(self) -> torch.Tensor:
+        """Return raw pRNN states produced by every collected action."""
+        missing = [idx for idx, SR in enumerate(self.experience_buffer.post_SRs) if SR is None]
+        if missing:
+            raise RuntimeError(
+                "Internal rewards require a post-action SR for every rollout "
+                f"step; missing indices: {missing}."
+            )
+        return torch.cat(self.experience_buffer.post_SRs, dim=0).to(self.device)
+
+    def _last_SR_without_advancing_predictive_state(self, det_action: np.ndarray) -> torch.Tensor:
+        """Evaluate the rollout tail without changing the next collection state."""
+        predictive_net = self.spatial_config.predictive_net
+        saved_state = predictive_net.state.clone()
+        saved_phase = predictive_net.phase
+        try:
+            return self.SR_strategy.last_SR(
+                SR=self.SR,
+                det_action=det_action,
+                obs=self.obs,
+                state=self._state_for_prnn(),
+            )
+        finally:
+            predictive_net.state = saved_state
+            predictive_net.phase = saved_phase
+
+    def _internal_reward_state_pairs(
+            self, stored_SRs: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Build the exact ``SR(O_t), SR(O_(t+1))`` pair for every action.
+
+        ``post_SRs`` gives the pRNN state produced by each action.  With a
+        current-SR policy it is directly the successor of the actor input.
+        With a past-SR policy it is the state of the current observation, so
+        the successor is the following post-action state.  Terminal actions
+        instead use their recorded in-episode successor, never a reset SR.
+        """
+        post_SRs = self._post_action_SRs()
+        if not self.spatial_config.past_SR:
+            return stored_SRs, post_SRs
+
+        final_index = self.config.num_frames - 1
+        if final_index in self.experience_buffer.terminal_SR_successors:
+            tail_SR = self.experience_buffer.terminal_SR_successors[final_index].to(
+                device=post_SRs.device, dtype=post_SRs.dtype
+            )
+        else:
+            _, _, _, det_action = self._select_action()
+            tail_SR = self._last_SR_without_advancing_predictive_state(det_action)
+        next_SRs = torch.cat((post_SRs[1:], tail_SR), dim=0)
+        for idx, successor in self.experience_buffer.terminal_SR_successors.items():
+            next_SRs[idx] = successor.to(device=next_SRs.device, dtype=next_SRs.dtype)
+        return post_SRs, next_SRs
 
     def _substitute_past_SR_terminal_states(self, SRs: torch.Tensor) -> torch.Tensor:
         """Replace shifted reset placeholders with terminal pRNN states.
@@ -711,6 +784,7 @@ class PredictivePPOAlgo:
         """
         logger.debug("Starting experience collection")
         self.experience_buffer.past_SR_terminal_states = {}
+        self.experience_buffer.terminal_SR_successors = {}
         
         # Collect experiences
         any_done = False
@@ -1418,6 +1492,7 @@ class GoalConditionedPPOAlgo(PredictivePPOAlgo):
             loc=self.loc,
             mask=self.mask,
             reward_past=reward_past,
+            SR_next=SR_new,
         )
 
         # Update state
@@ -1486,25 +1561,12 @@ class GoalConditionedPPOAlgo(PredictivePPOAlgo):
         # --- Internal (proximity) rewards --------------------------------
         if self.internal_strategy:
             raw_sr_size = self.SR.shape[1]          # self.SR is always the raw SR
-
-            if self.spatial_config.past_SR:
-                _, _, _, det_action = self._select_action()
-                SR_last = self.SR_strategy.last_SR(
-                    SR=self.SR,
-                    det_action=det_action,
-                    obs=self.obs,
-                )
-                raw_SRs = torch.cat(
-                    (self.experience_buffer.SRs[1:, :raw_sr_size], SR_last), dim=0
-                )
-                raw_SRs = self._substitute_past_SR_terminal_states(raw_SRs)
-                episode_end_indices = self.experience_buffer.past_SR_terminal_states.keys()
-            else:
-                raw_SRs = self.experience_buffer.SRs[:, :raw_sr_size]
-                episode_end_indices = None
+            raw_SRs, next_raw_SRs = self._internal_reward_state_pairs(
+                self.experience_buffer.SRs[:, :raw_sr_size]
+            )
 
             internal_rewards = self.internal_strategy.compute_rewards(
-                SRs=raw_SRs, episode_end_indices=episode_end_indices
+                SRs=raw_SRs, next_SRs=next_raw_SRs
             )
             self.experience_buffer.store_rewards("internal", internal_rewards)
 
