@@ -685,7 +685,14 @@ class PredictivePPOAlgo:
 
     def _last_SR_without_advancing_predictive_state(self, det_action: np.ndarray) -> torch.Tensor:
         """Evaluate the rollout tail without changing the next collection state."""
-        predictive_net = self.spatial_config.predictive_net
+        # ``spatial_config.predictive_net`` is the Hydra checkpoint
+        # configuration.  The recurrent state belongs to the separately
+        # supplied, loaded PredictiveNet instance.
+        predictive_net = self.predictiveNet
+        if predictive_net is None:
+            raise RuntimeError(
+                "Internal reward tail evaluation requires a loaded predictive network."
+            )
         saved_state = predictive_net.state.clone()
         saved_phase = predictive_net.phase
         try:
