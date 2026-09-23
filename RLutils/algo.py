@@ -721,6 +721,24 @@ class PredictivePPOAlgo:
         if not self.spatial_config.past_SR:
             return stored_SRs, post_SRs
 
+        timing = str(
+            getattr(self.reward_config, "internal_reward_timing", "actor_aligned")
+        ).lower()
+        assert timing in {"actor_aligned", "causal"}, (
+            "internal_reward_timing must be 'actor_aligned' or 'causal'"
+        )
+        if timing == "actor_aligned":
+            # At PPO index t the delayed-SR actor receives SR(O_(t-1)).
+            # Reproduce the established shaping convention by associating
+            # that actor state with its observed improvement to SR(O_t).
+            # The first reward is zero; a terminal-to-reset pair is zeroed.
+            actor_SRs = torch.cat((post_SRs[:1], post_SRs[:-1]), dim=0)
+            for terminal_index in self.experience_buffer.terminal_SR_successors:
+                reset_index = terminal_index + 1
+                if reset_index < self.config.num_frames:
+                    actor_SRs[reset_index] = post_SRs[reset_index]
+            return actor_SRs, post_SRs
+
         final_index = self.config.num_frames - 1
         if final_index in self.experience_buffer.terminal_SR_successors:
             tail_SR = self.experience_buffer.terminal_SR_successors[final_index].to(
