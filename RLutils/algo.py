@@ -1049,8 +1049,9 @@ class PredictivePPOAlgo:
                     
                     # Compute gradient norm
                     grad_norm = sum(
-                        p.grad.data.norm(2).item() ** 2 
+                        p.grad.detach().norm(2).item() ** 2
                         for p in self.acmodel.parameters()
+                        if p.grad is not None
                     ) ** 0.5
                     batch_metrics['grad_norm'] = grad_norm
                     
