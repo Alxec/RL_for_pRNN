@@ -1,9 +1,12 @@
+import gymnasium as gym
 import torch
 import numpy as np
+from ratinabox.utils import get_distances_between
 
 import RLutils
 from .other import device
 from RLutils.model import ACModel
+from RLutils.spatial_strategies import PredictiveNetworkPastSR, PredictiveNetworkSR
 
 
 class Agent:
@@ -57,41 +60,82 @@ class Agent:
         return self.analyze_feedbacks([reward], [done])
 
 
-class ActorCriticAgent:
+def move_prnn(prnn, device):
+    """Move a pRNN and any Shell encoder (Miniworld) to ``device``."""
+    prnn.pRNN.to(device)
+    encoder = getattr(prnn.env_shell, "encoder", None)
+    if isinstance(encoder, torch.nn.Module):
+        encoder.to(device)
 
-    def __init__(self, action_space, acmodel, prnn, device, pastSR=True):
+
+class ActorCriticAgent:
+    """Roll out a trained actor-critic to collect pRNN evaluation trajectories.
+
+    This repeats ``PredictivePPOAlgo._collect_single_step``: the actor gets the
+    SR computed by the algorithm's own spatial strategy, with the same SR and
+    HD timing as in training.  It serves both MiniGrid and continuous Miniworld.
+    For Miniworld, ``position_agent`` (a ``MiniworldRandomAgent``) supplies the
+    RatInABox position bins used by the pRNN's spatial decoding.
+    """
+
+    def __init__(self, action_space, acmodel, prnn, device, sr_strategy=None,
+                 past_SR=True, position_agent=None):
         self.action_space = action_space
         self.acmodel = acmodel
         self.prnn = prnn
         self.device = device
-        self.pastSR = pastSR
+        self.past_SR = bool(past_SR)
+        if sr_strategy is None:
+            # Unmasked pRNN SR, for callers without a PPO algorithm
+            sr_strategy = (
+                PredictiveNetworkPastSR(prnn, device) if self.past_SR
+                else PredictiveNetworkSR(prnn, device)
+            )
+        self.sr_strategy = sr_strategy
+        self.position_agent = position_agent
+        self.continuous = isinstance(action_space, gym.spaces.Box)
         self.name = 'ActorCritic Agent'
 
-    def next_SR(self, obs, act):
+    def _env_action(self, action):
+        action = action.detach().cpu()
+        return action.squeeze(0).numpy() if self.continuous else int(action.item())
 
-        obs = [obs, obs]
-    
-        obs_pN, act_pN = self.prnn.env_shell.env2pred(obs, act)
-        obs_pN, act_pN = obs_pN.to(self.device), act_pN.to(self.device)
-        with torch.no_grad(): # calculate SR for step t based on obs and action from step t-1
-            SR = self.prnn.predict_single(obs_pN[:,:-1,:], act_pN).squeeze(dim=0)
+    def _riab_position_bins(self, env, positions):
+        """Bin Miniworld positions exactly as ``MiniworldRandomAgent`` does.
 
-        return SR
-    
-    def getObservations(self, env, tsteps, reset=True, includeRender=False, **kwargs):
-        
-        self.prnn.pRNN.to(self.device)
+        Positions are converted to RatInABox coordinates, snapped to the
+        nearest cell of the random agent's RatInABox environment, and returned
+        as integer cell indices for the pRNN's spatial decoding.
+        """
+        positions = np.asarray(positions, dtype=float)
+        riab_positions = np.stack(
+            (positions[:, 0], env.env.size[1] - positions[:, 1]), axis=-1
+        ) / 10
+        riab_env = self.position_agent.Environment
+        dx = riab_env.dx
+        coord = riab_env.flattened_discrete_coords
+        dist = get_distances_between(riab_positions, coord)
+        return ((coord[dist.argmin(axis=1)] - dx/2) / dx).astype(int)
+
+    @staticmethod
+    def _prnn_state(hd):
+        return None if hd is None else {"agent_dir": np.float32(hd)}
+
+    def getObservations(self, env, tsteps, reset=True, includeRender=False,
+                        discretize=False, **kwargs):
+        if not reset:
+            raise NotImplementedError("On-policy pRNN evaluation starts from an environment reset.")
+        move_prnn(self.prnn, self.device)
+        _, preprocess_obss = RLutils.get_obss_preprocessor(env.observation_space)
         render = False
 
         obs = [None for t in range(tsteps+1)]
         act = [None for t in range(tsteps)]
 
-        if reset:
-            obs[0] = env.reset()
-        else:
-            o = env.env.gen_obs()
-            obs[0] = env.env.observation(o)
-        
+        obs[0] = env.reset()
+        self.prnn.reset_state(device=self.device)
+        SR = self.sr_strategy.initialize_SR(obs=obs[0])
+
         state = {'agent_pos': np.resize(env.get_agent_pos(),(1,2)), 
                  'agent_dir': env.get_agent_dir(),
                 }
@@ -100,34 +144,39 @@ class ActorCriticAgent:
             render = [None for t in range(tsteps+1)]
             render[0] = env.render(mode=None)
         
-        if self.pastSR:
-            SR = torch.zeros((1,self.prnn.hidden_size), device=self.device) 
-            state['SRs'] = SR.cpu().numpy()
-        else:
-            raise NotImplementedError
-        
         for aa in range(tsteps):
-            #obs_tensor = torch.tensor(obs[aa]['image'], device=self.device)
-            _, preprocess_obss = RLutils.get_obss_preprocessor(env.observation_space)
             preprocessed_obs = preprocess_obss([obs[aa]], device=self.device)
             with torch.no_grad():
                 dist, _ = self.acmodel(preprocessed_obs, SR=SR)
-                action = dist.sample()
-                act[aa] = action.cpu().numpy()
-            
+            act[aa] = self._env_action(dist.sample())
+            past_hd = env.get_agent_dir()
+
             obs[aa+1] = env.step(act[aa])[0]
             state['agent_pos'] = np.append(state['agent_pos'], 
                                            np.resize(env.get_agent_pos(),(1,2)),axis=0)
             state['agent_dir'] = np.append(state['agent_dir'],
                                            env.get_agent_dir())
 
-            SR = self.next_SR(obs[aa], act[aa])
-            state['SRs'] = np.append(state['SRs'], SR.cpu().numpy())
+            hd = past_hd if self.past_SR else env.get_agent_dir()
+            SR = self.sr_strategy.compute_SR(
+                action=act[aa], past_obs=obs[aa], new_obs=obs[aa+1],
+                state=self._prnn_state(hd),
+            )
 
             if includeRender:
                 render[aa+1] = env.render(mode=None)
         
-        self.prnn.pRNN.to("cpu")
-        
-        act = np.array(act).reshape(-1)
+        self.prnn.reset_state(device=self.device)
+        # pRNN analyses run on the CPU
+        move_prnn(self.prnn, "cpu")
+
+        if self.continuous:
+            act = np.stack(act)
+            if discretize:
+                if self.position_agent is None:
+                    raise ValueError("Discretised Miniworld positions require position_agent.")
+                state['pos_continuous'] = state['agent_pos'].copy()
+                state['agent_pos'] = self._riab_position_bins(env, state['agent_pos'])
+        else:
+            act = np.array(act).reshape(-1)
         return obs, act, state, render

@@ -7,11 +7,13 @@ to enhance learning through internal rewards and curiosity-driven exploration.
 
 import logging
 from abc import ABC, abstractmethod
-from typing import Iterable, List, Dict, Tuple
+from typing import Iterable, List, Dict, Optional, Tuple
 
 import torch
 import numpy as np
 from scipy.spatial.distance import cosine
+
+from prnn.utils.Architectures import RolloutRNN
 
 logger = logging.getLogger(__name__)
 
@@ -263,6 +265,23 @@ class InternalRewardStrategy(RewardStrategy):
         self.rewards = torch.zeros_like(self.rewards)
 
 
+def prnn_inputs(predictive_net, obs: List, act: np.ndarray, state: Optional[Dict] = None):
+    """Convert one stored trajectory into pRNN ``(obs, act)`` tensors.
+
+    MiniGrid Shells read HD from the observations.  Miniworld Shells need the
+    trajectory's continuous HDs, one per observation, as ``state``.
+    """
+    if state is None:
+        return predictive_net.env_shell.env2pred(obs, act)
+    return predictive_net.env_shell.env2pred(obs, act, state=state)
+
+
+def _append_action(actions: np.ndarray, action) -> np.ndarray:
+    """Append one scalar (MiniGrid) or vector (Miniworld) action."""
+    action = np.asarray(action, dtype=actions.dtype).reshape((1,) + actions.shape[1:])
+    return np.concatenate([actions, action])
+
+
 class CuriousRewardStrategy(RewardStrategy):
     """Compute curious rewards based on prediction error."""
     
@@ -271,34 +290,47 @@ class CuriousRewardStrategy(RewardStrategy):
         self.pN = predictive_net
         self.k_curious = k_curious
         self.device = device
+
+    def _require_one_prediction_per_action(self):
+        # Checked when rewards are computed, so that the random-agent control
+        # (which never computes them) still runs with a curious config.
+        if isinstance(self.pN.pRNN, RolloutRNN):
+            raise NotImplementedError(
+                "Curious rewards are not defined for rollout pRNNs: their "
+                "predictions are (k+1 rollout steps) x (T-k timesteps), not "
+                "one prediction error per action."
+            )
     
     def compute_rewards(self, obss: List[Dict], actions: np.ndarray, num_frames: int,
                         done_indices: List[int], last_observations: List[Dict],
-                        last_actions: List[np.ndarray]) -> torch.Tensor:
+                        last_actions: List[np.ndarray],
+                        episode_hds: Optional[List[np.ndarray]] = None) -> torch.Tensor:
         """
         Compute curious rewards based on prediction error.
         
         Args:
             obss: List of observations
             actions: Actions taken [num_frames]
+            episode_hds: Per-trajectory HDs, one per observation (Miniworld only)
         
         Returns:
             Curious rewards [num_frames]
         """
+        self._require_one_prediction_per_action()
         with torch.no_grad():
             MSEs = torch.zeros(num_frames, device=self.device)
 
             for idx in range(1, len(done_indices)):
                 start_episode, end_episode = done_indices[idx-1], done_indices[idx]
                 last_obs = last_observations[idx-1]
-                last_act = last_actions[idx-1]
                 acts_now = actions[start_episode:end_episode]
                 obs_now = obss[start_episode:end_episode] + [last_obs]
-                obs_formatted, act_formatted = self.pN.env_shell.env2pred(obs_now, acts_now)
+                state = None if episode_hds is None else {"agent_dir": episode_hds[idx-1]}
+                obs_formatted, act_formatted = prnn_inputs(self.pN, obs_now, acts_now, state)
                 obs_formatted, act_formatted = obs_formatted.to(self.device), act_formatted.to(self.device)
                 obs_pred, obs_next, _ = self.pN.predict(obs_formatted, act_formatted)
                 obs_pred, obs_next = obs_pred.squeeze(0), obs_next.squeeze(0)
-                MSEs[start_episode:end_episode] = ((obs_pred - obs_next) ** 2).mean(dim=1)
+                MSEs[start_episode:end_episode] = _prediction_errors(obs_pred, obs_next)
             
         return self.k_curious * MSEs
     
@@ -313,17 +345,20 @@ class NextCuriousRewardStrategy(CuriousRewardStrategy):
 
     def compute_rewards(self, obss: List[Dict], actions: np.ndarray, num_frames: int,
                         done_indices: List[int], last_observations: List[Dict],
-                        last_actions: List[np.ndarray]) -> torch.Tensor:
+                        last_actions: List[np.ndarray],
+                        episode_hds: Optional[List[np.ndarray]] = None) -> torch.Tensor:
         """
         Compute curious rewards based on prediction error.
         
         Args:
             obss: List of observations
             actions: Actions taken [num_frames]
+            episode_hds: Per-trajectory HDs, one per observation (Miniworld only)
         
         Returns:
             Curious rewards [num_frames]
         """
+        self._require_one_prediction_per_action()
         with torch.no_grad():
             MSEs = torch.zeros(num_frames, device=self.device)
 
@@ -331,15 +366,24 @@ class NextCuriousRewardStrategy(CuriousRewardStrategy):
                 start_episode, end_episode = done_indices[idx-1], done_indices[idx]
                 last_obs = last_observations[idx-1]
                 last_act = last_actions[idx-1]
-                acts_now = np.concatenate([actions[start_episode:end_episode], last_act])
+                acts_now = _append_action(actions[start_episode:end_episode], last_act)
                 # Adding two last_obs is a hack, because prednet expects one more obs than acts,
                 # it shouldn't affect same-step prediction
                 obs_now = obss[start_episode:end_episode] + [last_obs] + [last_obs]
-                obs_formatted, act_formatted = self.pN.env_shell.env2pred(obs_now, acts_now)
+                state = None
+                if episode_hds is not None:
+                    hds = episode_hds[idx-1]
+                    state = {"agent_dir": np.append(hds, hds[-1])}
+                obs_formatted, act_formatted = prnn_inputs(self.pN, obs_now, acts_now, state)
                 obs_formatted, act_formatted = obs_formatted.to(self.device), act_formatted.to(self.device)
                 obs_pred, obs_next, _ = self.pN.predict(obs_formatted, act_formatted)
                 # Remove the first prediction because we get reward for the first action, which corresponds to the second observation
                 obs_pred, obs_next = obs_pred.squeeze(0)[1:], obs_next.squeeze(0)[1:]
-                MSEs[start_episode:end_episode] = ((obs_pred - obs_next) ** 2).mean(dim=1)
+                MSEs[start_episode:end_episode] = _prediction_errors(obs_pred, obs_next)
             
         return self.k_curious * MSEs
+
+
+def _prediction_errors(obs_pred: torch.Tensor, obs_next: torch.Tensor) -> torch.Tensor:
+    """Mean squared error per timestep over all observation dimensions."""
+    return ((obs_pred - obs_next) ** 2).flatten(start_dim=1).mean(dim=1)

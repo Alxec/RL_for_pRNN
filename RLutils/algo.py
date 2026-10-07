@@ -18,16 +18,29 @@ from omegaconf import DictConfig, OmegaConf
 from .reward_strategies import (
     InternalRewardStrategy,
     CuriousRewardStrategy,
+    NextCuriousRewardStrategy,
     GoalSelectionStrategy,
     RandomGoalStrategy,
     RandomLocationGoalStrategy,
+    prnn_inputs,
 )
 from .spatial_strategies import NoSpatialRepresentation, create_spatial_representation_strategy
+from prnn.utils.Architectures import RolloutRNN
 from .other import synthesize
 from .analysis import mutual_info_policy
 from RLutils.goal_video_recorder import GoalMarkedVideoRecorder
 
 logger = logging.getLogger(__name__)
+
+
+def min_prnn_trajectory_actions(predictive_net) -> int:
+    """Fewest actions a trajectory needs for one pRNN training step.
+
+    A rollout pRNN predicts ``k`` steps ahead and so needs more than ``k``
+    actions; other pRNNs train on trajectories of any length.
+    """
+    pRNN = predictive_net.pRNN
+    return pRNN.k + 1 if isinstance(pRNN, RolloutRNN) else 1
 
 
 # ============================================================================
@@ -51,6 +64,9 @@ class StepData:
     # from ``SR``: goal-conditioned PPO stores ``SR || goal`` in ``SR`` for
     # the actor, whereas intrinsic rewards always operate on raw pRNN states.
     SR_next: Optional[torch.Tensor] = None
+    # Continuous HD of ``obs`` (Miniworld only).  Miniworld pRNN action
+    # encodings need the full HD trajectory alongside the stored actions.
+    hd: Optional[float] = None
 
 
 class ExperienceBuffer:
@@ -68,6 +84,7 @@ class ExperienceBuffer:
         
         # Initialize buffers
         self.obss = [None] * num_frames
+        self.hds = [None] * num_frames
         self.locs = [None] * num_frames
         self.masks = torch.zeros(num_frames, device=device)
         self.continuous_actions = isinstance(action_space, gym.spaces.Box)
@@ -92,6 +109,7 @@ class ExperienceBuffer:
         self.done_indices = [0]
         self.last_observations = []
         self.last_actions = []
+        self.last_hds = []
         # In past-SR PPO, the first stored SR after an environment reset is a
         # zero placeholder.  Keep the actual SR from the preceding terminal
         # action so intrinsic rewards can retain the within-episode transition.
@@ -104,6 +122,7 @@ class ExperienceBuffer:
     def store_step(self, idx: int, step_data: StepData):
         """Store data from a single step."""
         self.obss[idx] = step_data.obs
+        self.hds[idx] = step_data.hd
         self.locs[idx] = step_data.loc
         self.SRs[idx] = step_data.SR
         if step_data.SR_next is not None:
@@ -127,11 +146,13 @@ class ExperienceBuffer:
             act: np.ndarray,
             past_SR_terminal_state: torch.Tensor | None = None,
             terminal_SR_successor: torch.Tensor | None = None,
+            hd: float | None = None,
         ):
         """Mark trajectory end for pRNN training."""
         self.done_indices.append(idx + 1)
         self.last_observations.append(obs)
         self.last_actions.append(act)
+        self.last_hds.append(hd)
         if past_SR_terminal_state is not None:
             self.past_SR_terminal_states[idx] = past_SR_terminal_state.detach().clone()
         if terminal_SR_successor is not None:
@@ -142,8 +163,24 @@ class ExperienceBuffer:
         self.done_indices = [0]
         self.last_observations = []
         self.last_actions = []
+        self.last_hds = []
         self.past_SR_terminal_states = {}
         self.terminal_SR_successors = {}
+
+    def episode_hds(self) -> Optional[List[np.ndarray]]:
+        """Return each completed trajectory's HD sequence, one per observation.
+
+        Miniworld pRNN action encodings need these HDs.  MiniGrid Shells read
+        HD from the observations and ignore them.  ``None`` if no Shell HD.
+        """
+        if any(hd is None for hd in self.last_hds) or not self.last_hds:
+            return None
+        sequences = []
+        for idx in range(1, len(self.done_indices)):
+            start, end = self.done_indices[idx - 1], self.done_indices[idx]
+            hds = self.hds[start:end] + [self.last_hds[idx - 1]]
+            sequences.append(np.asarray(hds, dtype=np.float32))
+        return sequences
     
     def compute_advantages(
             self,
@@ -418,16 +455,44 @@ class PredictivePPOAlgo:
         if self.reward_config.curious_enabled:
             assert self.predictiveNet is not None, \
                 "Curious requires predictive network"
-            self.curious_strategy = CuriousRewardStrategy(
+            strategy_class = (
+                NextCuriousRewardStrategy if self._curious_uses_next_obs()
+                else CuriousRewardStrategy
+            )
+            self.curious_strategy = strategy_class(
                 predictive_net=self.predictiveNet,
                 k_curious=self.reward_config.curious_coef,
                 device=self.device,
             )
-            logger.info("Curious reward strategy enabled")
+            logger.info(f"Curious reward strategy enabled: {strategy_class.__name__}")
         else:
             self.curious_strategy = None
             self.curious_rewards = None
     
+    def _curious_uses_next_obs(self) -> bool:
+        """Match the curious prediction error to the pRNN's action timing.
+
+        An ordinary pRNN (``past_SR=true``) receives ``a_t`` with ``o_t``, so
+        the action's error is in the prediction of ``o_(t+1)``.  An
+        action-offset pRNN (``past_SR=false``) receives ``a_t`` one step
+        later, so the error is in the prediction of ``o_(t+2)``.
+        ``rewards.next_obs=null`` selects automatically.
+        """
+        expected = not bool(self.spatial_config.past_SR)
+        next_obs = OmegaConf.select(self.reward_config, "next_obs") \
+            if isinstance(self.reward_config, DictConfig) \
+            else getattr(self.reward_config, "next_obs", None)
+        if next_obs is None:
+            return expected
+        if bool(next_obs) != expected:
+            raise ValueError(
+                f"rewards.next_obs={bool(next_obs)} does not match "
+                f"SR.past_SR={bool(self.spatial_config.past_SR)}: the next-observation "
+                "curious reward is for action-offset (past_SR=false) pRNNs. "
+                "Use rewards.next_obs=null to select it automatically."
+            )
+        return bool(next_obs)
+
     def _setup_experience_buffer(self):
         """Initialize experience buffer."""
         SR_size = self.SR_strategy.get_SR_size(self.SR)
@@ -584,6 +649,7 @@ class PredictivePPOAlgo:
             loc=self.loc,
             mask=self.mask,
             SR_next=SR_new,
+            hd=past_hd,
         )
         
         # Update state
@@ -630,17 +696,35 @@ class PredictivePPOAlgo:
             det_action,
             past_SR_terminal_state=terminal_state,
             terminal_SR_successor=terminal_successor,
+            hd=self._get_hd(),
         )
         
         # Reset environment and SR
         if self.spatial_config.predictive_net:
             self.predictiveNet.reset_state(device=self.device)
         
-        self.SR = self.SR_strategy.initialize_SR(obs=self.obs)
+        # A current-SR strategy encodes the new episode's first observation
+        # (and its HD), so it is initialised only after the reset.
         self.obs = self.env.reset()
-        
+        self.SR = self.SR_strategy.initialize_SR(obs=self.obs)
+
         logger.debug(f"Episode ended at step {idx}")
     
+    def _mark_rollout_end(self):
+        """Close the rollout's unfinished trajectory for the pRNN.
+
+        Curious rewards and pRNN training use completed trajectories only.
+        Without this mark the frames after the rollout's last episode end
+        would get no curious reward and never train the pRNN.  The episode
+        itself continues: the next rollout's first trajectory starts mid-way
+        through it.  Internal-reward bookkeeping is deliberately untouched,
+        as no environment transition crosses this boundary.
+        """
+        _, _, _, det_action = self._select_action()
+        self.experience_buffer.add_traj_end(
+            self.config.num_frames - 1, self.obs, det_action, hd=self._get_hd()
+        )
+
     def _compute_augmented_rewards(self) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Compute all augmented rewards.
@@ -669,7 +753,8 @@ class PredictivePPOAlgo:
                 num_frames=self.config.num_frames,
                 done_indices=self.experience_buffer.done_indices,
                 last_observations=self.experience_buffer.last_observations,
-                last_actions=self.experience_buffer.last_actions
+                last_actions=self.experience_buffer.last_actions,
+                episode_hds=self.experience_buffer.episode_hds(),
             )
             self.experience_buffer.store_rewards('curious', curious_rewards)
 
@@ -808,8 +893,9 @@ class PredictivePPOAlgo:
             experiences: DictList containing all experience data
         """
         logger.debug("Starting experience collection")
-        self.experience_buffer.past_SR_terminal_states = {}
-        self.experience_buffer.terminal_SR_successors = {}
+        # Trajectory boundaries describe only this rollout.  pRNN training
+        # also clears them, but curious rewards need them without training.
+        self.experience_buffer.reset_trajectories()
         
         # Collect experiences
         any_done = False
@@ -832,6 +918,8 @@ class PredictivePPOAlgo:
         # If no episode ended, count the last frame as done
         if not any_done:
             self._handle_episode_end(self.config.num_frames - 1)
+        elif not done:
+            self._mark_rollout_end()
         
         # Compute augmented rewards
         self._compute_augmented_rewards()
@@ -962,7 +1050,7 @@ class PredictivePPOAlgo:
         return batches
     
     def _train_predictive_network(self, exps: DictList):
-        """Train the pRNN on collected experiences."""
+        """Train the pRNN on every trajectory completed in this rollout."""
         if not self.spatial_config.train:
             return
         
@@ -971,35 +1059,31 @@ class PredictivePPOAlgo:
         pN = self.predictiveNet
         pN.pRNN.to(self.device)
         
-        # Extract episode info before batching
-        done_indices = self.experience_buffer.done_indices
-        last_observations = self.experience_buffer.last_observations
-        
+        buffer = self.experience_buffer
+        done_indices = buffer.done_indices
+        episode_hds = buffer.episode_hds()
+        actions = buffer.actions.cpu().numpy()
+        losses = []
+        min_actions = min_prnn_trajectory_actions(pN)
+
         for idx in range(1, len(done_indices)):
             start_episode = done_indices[idx - 1]
             end_episode = done_indices[idx]
-            last_obs = last_observations[idx - 1]
-            
-            # Extract episode data
-            images_tensor = exps.obs.image[start_episode:end_episode]
-            hd_tensor = exps.obs.direction[start_episode:end_episode]
-            
-            obs_for_pN = [
-                {'image': images_tensor[i].cpu().numpy(), 
-                 'direction': hd_tensor[i].item()}
-                for i in range(len(images_tensor))
-            ]
-            act_for_pN = exps.action[start_episode:end_episode].cpu().numpy()
-            
-            # Convert and train
-            obs, act = pN.env_shell.env2pred(obs_for_pN + [last_obs], act_for_pN)
-            obs = obs.to(self.device)
-            act = act.to(self.device)
-            
-            pN.trainStep(obs, act)
+            if end_episode - start_episode < min_actions:
+                continue  # too short for a rollout pRNN's k-step predictions
+            obs_for_pN = buffer.obss[start_episode:end_episode] + [buffer.last_observations[idx - 1]]
+            state = None if episode_hds is None else {"agent_dir": episode_hds[idx - 1]}
+
+            obs, act = prnn_inputs(
+                pN, obs_for_pN, actions[start_episode:end_episode], state
+            )
+            loss, _, _ = pN.trainStep(obs.to(self.device), act.to(self.device))
             pN.numTrainingEpochs += 1
-        
-        self.experience_buffer.reset_trajectories()
+            losses.append(float(loss))
+
+        self._logs_update["pRNN_loss"] = losses
+        self._logs_update["pRNN_trajectories_skipped"] = len(done_indices) - 1 - len(losses)
+        buffer.reset_trajectories()
     
     def update_parameters(self, exps: DictList, update_params: bool = True) -> None:
         """
@@ -1067,11 +1151,11 @@ class PredictivePPOAlgo:
                 for key, value in batch_metrics.items():
                     all_metrics[key].append(value)
         
-        # Train predictive network
-        self._train_predictive_network(exps)
-        
         # Store logs
         self._logs_update = {key: np.mean(values) for key, values in all_metrics.items()}
+
+        # Train predictive network
+        self._train_predictive_network(exps)
         
         logger.debug(f"Training complete - Policy loss: {self._logs_update.get('policy_loss', 0):.4f}, "
                     f"Value loss: {self._logs_update.get('value_loss', 0):.4f}")
@@ -1109,6 +1193,11 @@ class PredictivePPOAlgo:
             cur_rewards = synthesize(logs_collect["curious_rewards"], abs=True)
             for key, value in cur_rewards.items():
                 processed[f"cur_reward_{key}"] = value
+
+        if logs_update.get("pRNN_loss"):
+            processed["pRNN loss"] = float(np.mean(logs_update["pRNN_loss"]))
+        if "pRNN_trajectories_skipped" in logs_update:
+            processed["pRNN_trajectories_skipped"] = logs_update["pRNN_trajectories_skipped"]
         
         # Process values and advantages
         if "values" in logs_collect:
@@ -1154,6 +1243,11 @@ class PredictivePPOAlgo:
 
 
     def randomAgent_collect_exp_and_update(self, agent):
+        """Train the pRNN on one rollout's worth of hard-coded agent trajectories.
+
+        This is the control for curious agents: MiniGrid uses
+        ``RandomActionAgent`` and Miniworld uses ``MiniworldRandomAgent``.
+        """
         assert self.spatial_config.train, \
         "The only reason to have random actions in algo is to train the pRNN geinus..."
         pN = self.predictiveNet
@@ -1161,11 +1255,9 @@ class PredictivePPOAlgo:
         pN.pRNN.to(self.device)
         seqdur = self.spatial_config.predictive_net.seqdur
         numtrials = math.ceil(num_frames / seqdur)
-        locs = [None] * num_frames
-        loc_visits = np.zeros([self.env.width, self.env.height])
-        loc_history = [np.zeros(np.sum(self.loc_mask))] * 5
 
         log_curr_seqdurs = []
+        losses = []
         for bb in range(numtrials):
             curr_seqdur = min(
                     seqdur,
@@ -1180,34 +1272,29 @@ class PredictivePPOAlgo:
             
             #Train
             obs, act = obs.to(self.device), act.to(self.device)
-            _,_,_ = pN.trainStep(obs, act)
+            loss, _, _ = pN.trainStep(obs, act)
             pN.numTrainingEpochs += 1
+            losses.append(float(loss))
 
             #Collect location info
-            locs_array = state['agent_pos'][:-1,:]
-            loc_list_current = [tuple(thisloc) for thisloc in locs_array]
+            for loc in state['agent_pos'][:-1, :]:
+                self.metrics.update_location_visit(tuple(loc))
 
-            startidx = bb*seqdur
-            endidx = min(num_frames, (bb+1)*seqdur)
-            locs[startidx:endidx] = loc_list_current
+        loc_entropy, loc_entropy_5 = self.metrics.compute_location_entropy()
 
-        for loc in locs:
-            loc_visits[loc] += 1
-        loc_visits = loc_visits.flatten('F')[self.loc_mask]
-        loc_entropy = entropy(loc_visits, base=2)
-
-        loc_history.pop(0)
-        loc_history.append(loc_visits)
-        loc_entropy_5 = entropy(np.sum(loc_history, axis=0), base=2)
-
-        policy_entropy = entropy(agent.default_action_probability, base=2)
+        action_probability = getattr(agent, "default_action_probability", None)
+        policy_entropy = (
+            entropy(action_probability, base=2) if action_probability is not None
+            else float("nan")  # MiniworldRandomAgent has no discrete policy
+        )
 
         return {"num_frames": num_frames,
                 "num_frames_per_episode": log_curr_seqdurs,
                 "num_episodes": numtrials,
                 "entropy": policy_entropy,
                 "loc_entropy": loc_entropy,
-                "loc_entropy_5": loc_entropy_5}
+                "loc_entropy_5": loc_entropy_5,
+                "pRNN loss": float(np.mean(losses))}
 
 
 # ============================================================================
@@ -1607,6 +1694,7 @@ class GoalConditionedPPOAlgo(PredictivePPOAlgo):
                 done_indices=self.experience_buffer.done_indices,
                 last_observations=self.experience_buffer.last_observations,
                 last_actions=self.experience_buffer.last_actions,
+                episode_hds=self.experience_buffer.episode_hds(),
             )
             self.experience_buffer.store_rewards("curious", curious_rewards)
 

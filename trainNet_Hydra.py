@@ -157,7 +157,7 @@ def main(config: DictConfig):
                                     #   enc_loss_weight= config['encoder']['loss_weight'],
                                     #   enc_loss_power= config['encoder']['loss_power'],
                                     #   latent_dim= config['prnn']['latent_dim'],
-                                      wandb_log=True)
+                                      )
         predictiveNet.seed = config['hparams']['seed']
         predictiveNet.trainArgs = OmegaConf.to_container(config)
         predictiveNet.plotSampleTrajectory(env,agent,

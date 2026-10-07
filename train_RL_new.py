@@ -118,8 +118,7 @@ class RL_Trainer(object):
                                             dropp = args.SR.predictive_net.dropout,
                                             trainNoiseMeanStd = (args.SR.predictive_net.noisemean,
                                                                 args.SR.predictive_net.noisestd),
-                                            f = args.SR.predictive_net.sparsity,
-                                            wandb_log=True)
+                                            f = args.SR.predictive_net.sparsity)
             print("pRNN model initialized\n")
 
         return predictiveNet, env, mask_indices
