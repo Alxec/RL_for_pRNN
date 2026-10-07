@@ -17,6 +17,7 @@ from minigrid.wrappers import (
     SymbolicObsWrapper,
     ViewSizeWrapper,
 )
+from collections import deque
 from functools import partial
 
 import prnn.environments.Lroom
@@ -47,6 +48,69 @@ wrappers = {
 #replace lambda function so i can pickle pNet
 def episode_video_trigger(episode, vid_n_episodes):
     return episode % vid_n_episodes == 0
+
+
+class VideoSchedule:
+    """Episode trigger for rollout videos over one whole training run.
+
+    Episodes are recorded every ``initial_freq`` episodes during the first
+    ``initial_episodes`` episodes, and every ``log_freq`` episodes afterwards.
+    Once :meth:`observe_return` finds the mean return of the last
+    ``plateau_window`` updates at or above ``plateau_return``, one more
+    complete episode is recorded and recording then stops for good.
+
+    Gymnasium's ``RecordVideo`` queries the trigger at every step while it is
+    not recording, so a query must depend only on the episode index.
+    ``episode_offset`` (episodes completed before a checkpoint resume) turns
+    the caller's per-process episode index into the run-wide one.
+    """
+
+    def __init__(
+        self,
+        log_freq,
+        initial_freq=0,
+        initial_episodes=0,
+        plateau_return=None,
+        plateau_window=0,
+        episode_offset=0,
+        plateau_reached=False,
+    ):
+        if log_freq <= 0:
+            raise ValueError("VideoSchedule needs log_freq > 0; disable videos instead.")
+        self.log_freq = int(log_freq)
+        self.initial_freq = int(initial_freq)
+        self.initial_episodes = int(initial_episodes)
+        self.plateau_return = plateau_return
+        self.plateau_window = int(plateau_window)
+        self.episode_offset = int(episode_offset)
+        self.plateau_reached = bool(plateau_reached)
+        self._recent_returns = deque(maxlen=max(self.plateau_window, 1))
+        # A run resumed after its plateau has already recorded its last video.
+        self._final_episode = -1 if self.plateau_reached else None
+
+    def observe_return(self, return_mean):
+        """Add one update's mean return; True when this update reaches the plateau."""
+        if self.plateau_reached or self.plateau_return is None or self.plateau_window <= 0:
+            return False
+        self._recent_returns.append(float(return_mean))
+        if (
+            len(self._recent_returns) == self.plateau_window
+            and np.mean(self._recent_returns) >= self.plateau_return
+        ):
+            self.plateau_reached = True
+            return True
+        return False
+
+    def __call__(self, episode):
+        episode = self.episode_offset + int(episode)
+        if self.plateau_reached:
+            if self._final_episode is None:
+                # The first query may come mid-episode: record the next whole one.
+                self._final_episode = episode + 1
+            return episode == self._final_episode
+        if episode < self.initial_episodes and self.initial_freq > 0:
+            return episode % self.initial_freq == 0
+        return episode % self.log_freq == 0
 
 
 MINIWORLD_SHELL_TYPES = {
@@ -99,6 +163,7 @@ def make_minigrid_env(
              seed=0,
              vid_folder='',
              vid_n_episodes=0,
+             vid_trigger=None,
              wrapper=None,
              render_mode='rgb_array',
              act_enc=None,
@@ -124,9 +189,10 @@ def make_minigrid_env(
         env = wrappers[wrapper](env, **kwargs)
 
     #Below I replaced the lambda function. This allows me to pickle pNet without errors
-    if vid_n_episodes:
+    # A vid_trigger (e.g. VideoSchedule) replaces the fixed every-N-episodes rule.
+    if vid_n_episodes or vid_trigger:
         #env = RecordVideo(env, video_folder=vid_folder, episode_trigger=lambda x: x%vid_n_episodes == 0)
-        trigger_func = partial(episode_video_trigger, vid_n_episodes=vid_n_episodes)
+        trigger_func = vid_trigger or partial(episode_video_trigger, vid_n_episodes=vid_n_episodes)
         env = RecordVideo(env, video_folder=vid_folder, episode_trigger=trigger_func)
     
     env.reset(seed=seed)
@@ -141,6 +207,7 @@ def make_miniworld_env(
         seed=0,
         vid_folder='',
         vid_n_episodes=0,
+        vid_trigger=None,
         render_mode='rgb_array',
         act_enc='ContSpeedOnehotHDMiniworld',
         continuous_actions=True,
@@ -176,7 +243,7 @@ def make_miniworld_env(
     if with_HD:
         env = MiniworldHeadDirectionObsWrapper(env, hd_bins=hd_bins)
 
-    if vid_n_episodes:
+    if vid_n_episodes or vid_trigger:
         # Insert this below RecordVideo so it changes only rendered frames,
         # never the observation delivered to the actor-critic.
         env = MiniworldVideoInfoOverlayWrapper(
@@ -184,7 +251,7 @@ def make_miniworld_env(
             hd_bins=hd_bins,
             ac_receives_hd=with_HD,
         )
-        trigger_func = partial(episode_video_trigger, vid_n_episodes=vid_n_episodes)
+        trigger_func = vid_trigger or partial(episode_video_trigger, vid_n_episodes=vid_n_episodes)
         env = RecordVideo(env, video_folder=vid_folder, episode_trigger=trigger_func)
 
     env.reset(seed=seed)

@@ -3,7 +3,7 @@ import math
 import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Optional, List, Dict, Tuple, Any
+from typing import Callable, Optional, List, Dict, Tuple, Any
 
 import torch
 import numpy as np
@@ -18,29 +18,18 @@ from omegaconf import DictConfig, OmegaConf
 from .reward_strategies import (
     InternalRewardStrategy,
     CuriousRewardStrategy,
-    NextCuriousRewardStrategy,
     GoalSelectionStrategy,
     RandomGoalStrategy,
     RandomLocationGoalStrategy,
+    min_prnn_trajectory_actions,
     prnn_inputs,
 )
 from .spatial_strategies import NoSpatialRepresentation, create_spatial_representation_strategy
-from prnn.utils.Architectures import RolloutRNN
 from .other import synthesize
 from .analysis import mutual_info_policy
 from RLutils.goal_video_recorder import GoalMarkedVideoRecorder
 
 logger = logging.getLogger(__name__)
-
-
-def min_prnn_trajectory_actions(predictive_net) -> int:
-    """Fewest actions a trajectory needs for one pRNN training step.
-
-    A rollout pRNN predicts ``k`` steps ahead and so needs more than ``k``
-    actions; other pRNNs train on trajectories of any length.
-    """
-    pRNN = predictive_net.pRNN
-    return pRNN.k + 1 if isinstance(pRNN, RolloutRNN) else 1
 
 
 # ============================================================================
@@ -455,44 +444,18 @@ class PredictivePPOAlgo:
         if self.reward_config.curious_enabled:
             assert self.predictiveNet is not None, \
                 "Curious requires predictive network"
-            strategy_class = (
-                NextCuriousRewardStrategy if self._curious_uses_next_obs()
-                else CuriousRewardStrategy
-            )
-            self.curious_strategy = strategy_class(
+            self.curious_strategy = CuriousRewardStrategy(
                 predictive_net=self.predictiveNet,
                 k_curious=self.reward_config.curious_coef,
                 device=self.device,
+                predictions=getattr(self.reward_config, "curious_predictions", "all"),
+                timing=getattr(self.reward_config, "curious_reward_timing", "actor_aligned"),
             )
-            logger.info(f"Curious reward strategy enabled: {strategy_class.__name__}")
+            logger.info("Curious reward strategy enabled")
         else:
             self.curious_strategy = None
             self.curious_rewards = None
     
-    def _curious_uses_next_obs(self) -> bool:
-        """Match the curious prediction error to the pRNN's action timing.
-
-        An ordinary pRNN (``past_SR=true``) receives ``a_t`` with ``o_t``, so
-        the action's error is in the prediction of ``o_(t+1)``.  An
-        action-offset pRNN (``past_SR=false``) receives ``a_t`` one step
-        later, so the error is in the prediction of ``o_(t+2)``.
-        ``rewards.next_obs=null`` selects automatically.
-        """
-        expected = not bool(self.spatial_config.past_SR)
-        next_obs = OmegaConf.select(self.reward_config, "next_obs") \
-            if isinstance(self.reward_config, DictConfig) \
-            else getattr(self.reward_config, "next_obs", None)
-        if next_obs is None:
-            return expected
-        if bool(next_obs) != expected:
-            raise ValueError(
-                f"rewards.next_obs={bool(next_obs)} does not match "
-                f"SR.past_SR={bool(self.spatial_config.past_SR)}: the next-observation "
-                "curious reward is for action-offset (past_SR=false) pRNNs. "
-                "Use rewards.next_obs=null to select it automatically."
-            )
-        return bool(next_obs)
-
     def _setup_experience_buffer(self):
         """Initialize experience buffer."""
         SR_size = self.SR_strategy.get_SR_size(self.SR)
@@ -537,6 +500,13 @@ class PredictivePPOAlgo:
             eps=self.config.adam_eps
         )
     
+    @property
+    def optimal_return(self) -> Optional[float]:
+        """Best attainable episode return the environment declares, if any."""
+        # self.env is normally a pRNN Shell around the wrapped Gym environment.
+        gym_env = getattr(self.env, "env", self.env)
+        return getattr(getattr(gym_env, "unwrapped", gym_env), "optimal_return", None)
+
     def _get_agent_pos(self) -> Tuple[int, int]:
         """Get current agent position from environment."""
         if hasattr(self.env, 'get_agent_pos'):
@@ -1367,6 +1337,7 @@ class GoalConditionedPPOAlgo(PredictivePPOAlgo):
         video_log_freq: Optional[int] = None,
         video_folder: Optional[str] = None,
         video_ext: str = '',
+        video_trigger: Optional[Callable[[int], bool]] = None,
         device: Optional[torch.device] = None,
         preprocess_obss=None,
     ):
@@ -1378,6 +1349,9 @@ class GoalConditionedPPOAlgo(PredictivePPOAlgo):
                              Defaults to :class:`RandomGoalStrategy`.
             exclude_loactions: Optional 2xN numpy array of excluded goal
                                coordinates where each column is [x, y].
+            video_trigger:   Optional episode-index -> bool rule (e.g.
+                             ``RLutils.VideoSchedule``) replacing the fixed
+                             every-``video_log_freq``-episodes recording.
             (other args):    Forwarded to :class:`PredictivePPOAlgo`.
         """
         # Store goal pool early so _setup_experience_buffer can use it.
@@ -1422,12 +1396,13 @@ class GoalConditionedPPOAlgo(PredictivePPOAlgo):
         self.check_location = check_location
         self.video_log_freq = int(video_log_freq) if video_log_freq is not None else 0
         self.video_folder = video_folder
+        self.video_trigger = video_trigger
         self._video_recorder = None
         self._episode_counter = 0
 
         if self.video_log_freq < 0:
             raise ValueError("video_log_freq must be >= 0")
-        if self.video_log_freq > 0:
+        if self.video_log_freq > 0 or self.video_trigger is not None:
             if not self.video_folder:
                 raise ValueError(
                     "video_folder must be provided when video_log_freq is enabled"
@@ -1474,6 +1449,8 @@ class GoalConditionedPPOAlgo(PredictivePPOAlgo):
 
     def _should_record_current_episode(self) -> bool:
         """Whether the current episode should be recorded."""
+        if self.video_trigger is not None:
+            return self.video_trigger(self._episode_counter)
         return self.video_log_freq > 0 and self._episode_counter % self.video_log_freq == 0
 
     def _ensure_episode_video_recorder(self) -> None:
@@ -1504,6 +1481,11 @@ class GoalConditionedPPOAlgo(PredictivePPOAlgo):
             self._video_recorder.close()
         finally:
             self._video_recorder = None
+
+    @property
+    def optimal_return(self) -> float:
+        """Every episode can reach its goal, which pays a reward of one."""
+        return 1.0
 
     def _set_new_goal(self) -> None:
         """Select a new goal from the pool and update the internal strategy."""
@@ -1729,6 +1711,7 @@ class VisualGoalConditionedPPOAlgo(PredictivePPOAlgo):
         video_log_freq: Optional[int] = None,
         video_folder: Optional[str] = None,
         video_ext: str = "",
+        video_trigger: Optional[Callable[[int], bool]] = None,
         device: Optional[torch.device] = None,
         preprocess_obss=None,
     ):
@@ -1745,12 +1728,13 @@ class VisualGoalConditionedPPOAlgo(PredictivePPOAlgo):
         self.video_log_freq = int(video_log_freq) if video_log_freq is not None else 0
         self.video_folder = video_folder
         self._video_ext = video_ext
+        self.video_trigger = video_trigger
         self._video_recorder = None
         self._episode_counter = 0
 
         if self.video_log_freq < 0:
             raise ValueError("video_log_freq must be >= 0")
-        if self.video_log_freq > 0:
+        if self.video_log_freq > 0 or self.video_trigger is not None:
             if not self.video_folder:
                 raise ValueError(
                     "video_folder must be provided when video_log_freq is enabled"
@@ -1875,6 +1859,8 @@ class VisualGoalConditionedPPOAlgo(PredictivePPOAlgo):
         logger.debug("New visual location goal selected")
 
     def _should_record_current_episode(self) -> bool:
+        if self.video_trigger is not None:
+            return self.video_trigger(self._episode_counter)
         return self.video_log_freq > 0 and self._episode_counter % self.video_log_freq == 0
 
     def _ensure_episode_video_recorder(self) -> None:
@@ -1908,6 +1894,11 @@ class VisualGoalConditionedPPOAlgo(PredictivePPOAlgo):
                 - np.asarray(self.goal_loc, dtype=np.float32)
             )
         )
+
+    @property
+    def optimal_return(self) -> float:
+        """Every episode can reach its goal, which pays a reward of one."""
+        return 1.0
 
     def _check_goal(self, location) -> tuple[float, bool]:
         reached = bool(np.array_equal(np.asarray(location, dtype=int), self.goal_loc))
