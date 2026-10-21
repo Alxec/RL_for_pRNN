@@ -7,7 +7,7 @@ to enhance learning through internal rewards and curiosity-driven exploration.
 
 import logging
 from abc import ABC, abstractmethod
-from typing import Iterable, List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple
 
 import torch
 import numpy as np
@@ -36,94 +36,6 @@ class RewardStrategy(ABC):
         pass
 
 
-# ============================================================================
-# Goal Selection Strategies
-# ============================================================================
-
-class GoalSelectionStrategy(ABC):
-    """
-    Abstract base class for selecting a goal SR from a pool.
-
-    Subclass this to implement alternative goal-selection schemes
-    (e.g. curriculum, distance-based, or adversarial selection).
-    """
-
-    @abstractmethod
-    def select_goal(self, goal_pool: torch.Tensor) -> torch.Tensor:
-        """
-        Select a single goal SR from the pool.
-
-        Args:
-            goal_pool: Tensor of candidate goal SRs [n_goals, SR_dim].
-
-        Returns:
-            Selected goal SR [1, SR_dim].
-        """
-        pass
-
-
-class RandomGoalStrategy(GoalSelectionStrategy):
-    """Select a goal uniformly at random from the pool."""
-
-    def select_goal(self, goal_pool: torch.Tensor) -> torch.Tensor:
-        idx = torch.randint(goal_pool.shape[1], (1,)).item()
-        return goal_pool[:, idx], idx
-
-
-class RandomLocationGoalStrategy(GoalSelectionStrategy):
-    """Select a location goal and encode its x and y coordinates separately.
-
-    The location-goal PPO baseline deliberately does not depend on a pRNN
-    representation.  A candidate is an integer ``(x, y)`` environment
-    position, represented to the policy as ``onehot(x) || onehot(y)``.  This
-    preserves the factorisation of a grid location while making each goal
-    coordinate explicit to an otherwise visual actor-critic.
-    """
-
-    def __init__(self, width: int, height: int, device: torch.device):
-        if width <= 0 or height <= 0:
-            raise ValueError("Location-goal dimensions must both be positive.")
-        self.width = int(width)
-        self.height = int(height)
-        self.device = device
-
-    @property
-    def goal_size(self) -> int:
-        return self.width + self.height
-
-    def encode_location(self, location) -> torch.Tensor:
-        """Return a batch-one ``onehot(x) || onehot(y)`` goal tensor."""
-        location = np.asarray(location)
-        if location.shape != (2,):
-            raise ValueError(
-                "A location goal must have exactly two coordinates (x, y); "
-                f"received shape {location.shape}."
-            )
-        rounded = np.rint(location).astype(int)
-        if not np.allclose(location, rounded):
-            raise ValueError(
-                f"Location goals must use integer grid coordinates; got {location}."
-            )
-        x, y = rounded
-        if not (0 <= x < self.width and 0 <= y < self.height):
-            raise ValueError(
-                f"Goal {(x, y)} is outside the {self.width}x{self.height} grid."
-            )
-        goal = torch.zeros((1, self.goal_size), dtype=torch.float32, device=self.device)
-        goal[0, x] = 1.0
-        goal[0, self.width + y] = 1.0
-        return goal
-
-    def select_goal(self, goal_pool) -> tuple[torch.Tensor, int]:
-        locations = np.asarray(goal_pool)
-        if locations.ndim != 2 or locations.shape[1] != 2 or len(locations) == 0:
-            raise ValueError(
-                "Location goal pool must have shape (num_goals, 2) with at least one goal."
-            )
-        idx = torch.randint(len(locations), (1,)).item()
-        return self.encode_location(locations[idx]), idx
-
-
 class InternalRewardStrategy(RewardStrategy):
     """Compute internal rewards based on spatial representation similarity."""
     
@@ -148,68 +60,47 @@ class InternalRewardStrategy(RewardStrategy):
     def compute_rewards(
             self,
             SRs: torch.Tensor,
-            next_SRs: torch.Tensor | None = None,
-            episode_end_indices: Iterable[int] | None = None,
+            next_SRs: torch.Tensor,
+            references: torch.Tensor | None = None,
         ) -> torch.Tensor:
         """
-        Compute internal rewards based on cosine distance to reference SR.
-        
+        Compute internal rewards based on cosine distance to a reference SR.
+
+        Reward ``t`` is ``E(SRs[t]) - E(next_SRs[t])`` with ``E`` the cosine
+        distance to the reference.  Pairs never cross an episode boundary, so
+        no transition to a reset state is rewarded.
+
         Args:
             SRs: Spatial representations at the start of each action
                 [num_frames, SR_dim].
-            next_SRs: Optional representations reached by those actions,
-                with the same shape as ``SRs``.  When supplied, reward ``t``
-                is exactly ``E(SRs[t]) - E(next_SRs[t])``.  This is the PPO
-                path: it retains the last action and contains no cross-episode
-                transition.
-            episode_end_indices: Positions in ``SRs`` that end an episode.
-                Used only for the legacy one-sequence form, where the
-                terminal-to-reset delta is zeroed at the terminal index.
-        
+            next_SRs: Representations reached by those actions, same shape.
+            references: Optional per-action references, same shape, for
+                goals that change between episodes; otherwise the stored
+                reference applies to every action.  An all-zero reference
+                (no goal yet, or no goal in the episode) gives a zero reward.
+
         Returns:
-            One reward per supplied action when ``next_SRs`` is provided;
-            otherwise one reward per adjacent pair in ``SRs``.
+            One reward per action [num_frames].
         """
-        if not any(self.ref[0]):
-            return torch.zeros(SRs.shape[0], device=self.device)
-
-        SRs_cpu = SRs.detach().cpu().clone()
-        ref_cpu = self.ref.squeeze().detach().cpu().clone()
-        next_SRs_cpu = None
-        if next_SRs is not None:
-            if next_SRs.shape != SRs.shape:
-                raise ValueError(
-                    "next_SRs must have the same shape as SRs; received "
-                    f"{tuple(next_SRs.shape)} and {tuple(SRs.shape)}."
-                )
-            next_SRs_cpu = next_SRs.detach().cpu().clone()
-
-        if self.mask_internal:
-            SRs_cpu[:, self.mask_indices] = 0
-            if next_SRs_cpu is not None:
-                next_SRs_cpu[:, self.mask_indices] = 0
-            ref_cpu[self.mask_indices] = 0
-        
-        # Compute errors for all timesteps
-        errors = torch.tensor([cosine(SR, ref_cpu) for SR in SRs_cpu], device=self.device)
-        if next_SRs_cpu is not None:
-            next_errors = torch.tensor(
-                [cosine(SR, ref_cpu) for SR in next_SRs_cpu], device=self.device
+        if references is None:
+            references = self.ref.reshape(1, -1).expand_as(SRs)
+        if not (SRs.shape == next_SRs.shape == references.shape):
+            raise ValueError(
+                "SRs, next_SRs and references must have one shape; received "
+                f"{tuple(SRs.shape)}, {tuple(next_SRs.shape)} and {tuple(references.shape)}."
             )
-            return self.k_int * (errors - next_errors)
+        SRs_cpu, next_cpu, refs_cpu = (
+            x.detach().cpu().clone() for x in (SRs, next_SRs, references)
+        )
+        has_reference = refs_cpu.abs().sum(dim=1) > 0
+        if self.mask_internal:
+            for x in (SRs_cpu, next_cpu, refs_cpu):
+                x[:, self.mask_indices] = 0
+        rewards = torch.zeros(SRs.shape[0])
+        for t in torch.nonzero(has_reference).flatten().tolist():
+            rewards[t] = cosine(SRs_cpu[t], refs_cpu[t]) - cosine(next_cpu[t], refs_cpu[t])
+        return self.k_int * rewards.to(self.device)
 
-        # Legacy state-sequence form.  Callers that need one reward per PPO
-        # action must supply explicit successors above.
-        internal_rewards = errors[:-1] - errors[1:]
-        if episode_end_indices is not None:
-            cross_episode_indices = [
-                index for index in episode_end_indices
-                if index < len(internal_rewards)
-            ]
-            if cross_episode_indices:
-                internal_rewards[cross_episode_indices] = 0
-        return self.k_int * internal_rewards
-    
     def update_reference(self, SR: torch.Tensor):
         """Update reference SR using running average."""
         self.nrefs += 1
@@ -219,44 +110,6 @@ class InternalRewardStrategy(RewardStrategy):
         """Set reference SR directly."""
         self.nrefs = 1
         self.ref = SR
-
-    def check_goal(
-        self,
-        SR_new: torch.Tensor,
-        goal_threshold: float,
-        past_SR: bool,
-    ) -> Tuple[float, float, bool]:
-        """
-        Check whether *SR_new* is within *goal_threshold* cosine distance of
-        the current reference (goal) SR.
-
-        Args:
-            SR_new:          New spatial representation  [1, SR_dim]  (or [SR_dim]).
-            goal_threshold:  Cosine-distance threshold; smaller == more similar.
-            past_SR:         Reward routing flag.
-                             True  -> reward goes to the *previous* step  (reward_past=1).
-                             False -> reward goes to the *current*  step  (reward_new=1).
-
-        Returns:
-            reward_new:   Scalar reward to add to the *current* step.
-            reward_past:  Scalar reward to add to the *previous* step.
-            goal_reached: Whether the goal was reached.
-        """
-        if not any(self.ref[0]):
-            return 0.0, 0.0, False
-
-        dist = cosine(
-            SR_new.detach().cpu().squeeze().numpy(),
-            self.ref.detach().cpu().squeeze().numpy(),
-        )
-        goal_reached = bool(dist < goal_threshold)
-
-        if goal_reached:
-            if past_SR:
-                return 0.0, 1.0, True
-            else:
-                return 1.0, 0.0, True
-        return 0.0, 0.0, False
 
     def reset(self):
         """Reset strategy state."""
@@ -352,6 +205,11 @@ class CuriousRewardStrategy(RewardStrategy):
     observation as input (stream A) and those of the ``k`` preceding
     timesteps' rollouts (stream B).  ``predictions="rollout"`` averages
     stream B only.
+
+    ``center`` subtracts, and ``normalize_std`` divides by, the mean and
+    standard deviation of the previous rollout's raw errors (the first rollout
+    uses its own), before ``k_curious`` scales the reward.  Statistics cover
+    only actions that received a prediction error.
     """
 
     PREDICTIONS = ("all", "rollout")
@@ -359,7 +217,8 @@ class CuriousRewardStrategy(RewardStrategy):
 
     def __init__(self, predictive_net, k_curious: float,
                  device: torch.device, predictions: str = "all",
-                 timing: str = "actor_aligned"):
+                 timing: str = "actor_aligned", center: bool = False,
+                 normalize_std: bool = False):
         if timing not in self.TIMINGS:
             raise ValueError(
                 f"rewards.curious_reward_timing must be one of {self.TIMINGS}, got {timing!r}."
@@ -378,6 +237,10 @@ class CuriousRewardStrategy(RewardStrategy):
         self.device = device
         self.predictions = predictions
         self.timing = timing
+        self.center = bool(center)
+        self.normalize_std = bool(normalize_std)
+        self.previous_stats = None  # (mean, std) of the last rollout's raw errors
+        self.raw_rewards = None  # this rollout's unscaled errors, for logging
 
     def compute_rewards(self, obss: List[Dict], actions: np.ndarray, num_frames: int,
                         done_indices: List[int], last_observations: List[Dict],
@@ -397,7 +260,8 @@ class CuriousRewardStrategy(RewardStrategy):
         Returns:
             Curious rewards [num_frames]
         """
-        rewards = torch.zeros(num_frames, device=self.device)
+        errors = torch.zeros(num_frames, device=self.device)
+        rewarded = torch.zeros(num_frames, dtype=torch.bool, device=self.device)
         min_actions = min_prnn_trajectory_actions(self.pN)
         with torch.no_grad():
             for idx in range(1, len(done_indices)):
@@ -418,13 +282,30 @@ class CuriousRewardStrategy(RewardStrategy):
                 obs_pred, obs_target, _ = self.pN.predict(
                     obs_pN.to(self.device), act_pN.to(self.device)
                 )
-                rewards[start:end] = self._outcome_errors(obs_pred, obs_target, end - start)
+                errors[start:end], rewarded[start:end] = self._outcome_errors(
+                    obs_pred, obs_target, end - start
+                )
 
-        return self.k_curious * rewards
+        self.raw_rewards = errors
+        return self.k_curious * self._scale(errors, rewarded)
+
+    def _scale(self, errors: torch.Tensor, rewarded: torch.Tensor) -> torch.Tensor:
+        """Center and/or normalize with the previous rollout's statistics."""
+        if not rewarded.any():
+            return errors
+        current = (errors[rewarded].mean(), errors[rewarded].std(unbiased=False))
+        mean, std = self.previous_stats if self.previous_stats is not None else current
+        self.previous_stats = current
+        scaled = errors
+        if self.center:
+            scaled = scaled - mean
+        if self.normalize_std:
+            scaled = scaled / std.clamp(min=1e-8)
+        return torch.where(rewarded, scaled, torch.zeros_like(scaled))
 
     def _outcome_errors(self, obs_pred: torch.Tensor, obs_target: torch.Tensor,
-                        num_actions: int) -> torch.Tensor:
-        """Mean error of the predictions that belong to each action."""
+                        num_actions: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Mean error of the predictions of each action, and which actions have any."""
         errors = ((obs_pred - obs_target) ** 2).flatten(start_dim=2).mean(dim=2)
         rows, cols = errors.shape
         pRNN = self.pN.pRNN
@@ -443,7 +324,7 @@ class CuriousRewardStrategy(RewardStrategy):
         counts = torch.zeros(num_actions, device=errors.device).index_add_(
             0, action, torch.ones_like(errors)
         )
-        return totals / counts.clamp(min=1)
+        return totals / counts.clamp(min=1), counts > 0
 
     def reset(self):
         """Reset strategy state."""

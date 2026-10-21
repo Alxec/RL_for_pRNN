@@ -117,14 +117,17 @@ class ACModel(nn.Module, torch_ac.ACModel):
     """Feed-forward actor-critic model for visual observations.
 
     A convolutional image embedding, optionally augmented with one-hot head
-    direction, is consumed by separate actor and critic heads.
+    direction, is consumed by separate actor and critic heads.  With
+    ``value_heads=2`` the critic outputs ``(batch, 2)`` values: the task
+    return and the curious return (see ``PredictivePPOAlgo``).
     """
 
-    def __init__(self, obs_space, action_space, with_HD=True, rgb=True):
+    def __init__(self, obs_space, action_space, with_HD=True, rgb=True, value_heads=1):
         super().__init__()
         self.with_HD = with_HD
         self.rgb = rgb
         self.act_dim = action_space.n
+        self.value_heads = int(value_heads)
         self.define_model(obs_space)
 
         # Initialize parameters correctly
@@ -145,7 +148,7 @@ class ACModel(nn.Module, torch_ac.ACModel):
         self.critic = nn.Sequential(
             nn.Linear(self.embedding_size, 64),
             nn.Tanh(),
-            nn.Linear(64, 1)
+            nn.Linear(64, self.value_heads)
         )
 
     @property
@@ -262,11 +265,12 @@ class ACModelSR(ACModel):
     """
 
     def __init__(self, obs_space, action_space, SR_size=-1, with_CV=True, 
-                 rgb=True, with_HD=True):
+                 rgb=True, with_HD=True, value_heads=1):
         self.with_CV = with_CV
         self.SR_single = SR_size # if SRs are not used, the arg should be -1
         super(ACModelSR, self).__init__(obs_space, action_space, 
-                                        with_HD=with_HD, rgb=rgb)
+                                        with_HD=with_HD, rgb=rgb,
+                                        value_heads=value_heads)
 
     @property
     def SR_size(self):
@@ -443,8 +447,10 @@ class ContinuousACModel(nn.Module, torch_ac.ACModel):
             visual_encoder: nn.Module | None = None,
             freeze_visual_encoder=False,
             numHDs=4,
+            value_heads=1,
     ):
         super().__init__()
+        self.value_heads = int(value_heads)
         if not hasattr(action_space, "shape"):
             raise TypeError("ContinuousACModel requires a Gymnasium Box action space.")
         self.with_HD = with_HD
@@ -510,7 +516,7 @@ class ContinuousACModel(nn.Module, torch_ac.ACModel):
         self.critic = nn.Sequential(
             nn.Linear(self.embedding_size, 64),
             nn.Tanh(),
-            nn.Linear(64, 1),
+            nn.Linear(64, self.value_heads),
         )
 
     def _distribution(self, embedding):
@@ -540,6 +546,7 @@ class ContinuousACModelSR(ContinuousACModel):
             visual_encoder: nn.Module | None = None,
             freeze_visual_encoder=False,
             numHDs=4,
+            value_heads=1,
     ):
         self.with_CV = with_CV
         self.SR_single = SR_size
@@ -551,6 +558,7 @@ class ContinuousACModelSR(ContinuousACModel):
             visual_encoder=visual_encoder,
             freeze_visual_encoder=freeze_visual_encoder,
             numHDs=numHDs,
+            value_heads=value_heads,
         )
 
     @property

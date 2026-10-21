@@ -18,13 +18,21 @@ from omegaconf import DictConfig, OmegaConf
 from .reward_strategies import (
     InternalRewardStrategy,
     CuriousRewardStrategy,
-    GoalSelectionStrategy,
-    RandomGoalStrategy,
-    RandomLocationGoalStrategy,
     min_prnn_trajectory_actions,
     prnn_inputs,
 )
-from .spatial_strategies import NoSpatialRepresentation, create_spatial_representation_strategy
+from .spatial_strategies import (
+    NoSpatialRepresentation,
+    PredictiveNetworkSR,
+    create_spatial_representation_strategy,
+)
+from .goals import (
+    AdaptiveGoalThreshold,
+    GoalPool,
+    LocationGoalPool,
+    StateGoalPool,
+    excluded_locations,
+)
 from .other import synthesize
 from .analysis import mutual_info_policy
 from RLutils.goal_video_recorder import GoalMarkedVideoRecorder
@@ -59,7 +67,13 @@ class StepData:
 
 
 class ExperienceBuffer:
-    """Buffer for storing and managing experience data."""
+    """Buffer for storing and managing experience data.
+
+    With ``value_heads=2`` the task return (environment, goal and internal
+    rewards; cut at episode ends) and the curious return (not cut at episode
+    ends: curiosity continues across episodes) have their own values and
+    advantages, and the policy uses their sum.
+    """
     
     def __init__(
             self,
@@ -67,9 +81,11 @@ class ExperienceBuffer:
             SR_size: int,
             device: torch.device,
             action_space=None,
+            value_heads: int = 1,
     ):
         self.num_frames = num_frames
         self.device = device
+        self.value_heads = int(value_heads)
         
         # Initialize buffers
         self.obss = [None] * num_frames
@@ -84,6 +100,7 @@ class ExperienceBuffer:
         else:
             self.actions = torch.zeros(num_frames, device=device, dtype=torch.int)
         self.values = torch.zeros(num_frames, device=device)
+        self.values_curious = torch.zeros(num_frames, device=device)
         self.SRs = torch.zeros((num_frames, SR_size), device=device)
         # ``post_SRs[t]`` is the raw pRNN state produced after action ``t``.
         # A list permits goal-conditioned PPO to store an actor input of a
@@ -91,6 +108,7 @@ class ExperienceBuffer:
         self.post_SRs = [None] * num_frames
         self.rewards = torch.zeros(num_frames, device=device)
         self.advantages = torch.zeros(num_frames, device=device)
+        self.advantages_curious = torch.zeros(num_frames, device=device)
         self.log_probs = torch.zeros(num_frames, device=device)
         self.all_rewards = {'extrinsic': self.rewards}
         
@@ -118,7 +136,7 @@ class ExperienceBuffer:
             self.post_SRs[idx] = step_data.SR_next.detach().clone()
         self.masks[idx] = step_data.mask
         self.actions[idx] = step_data.action
-        self.values[idx] = step_data.value
+        self.values[idx], self.values_curious[idx] = self.split_value(step_data.value)
         self.rewards[idx] = step_data.reward
         self.log_probs[idx] = step_data.log_prob
         if step_data.reward_past is not None and idx > 0:
@@ -171,6 +189,11 @@ class ExperienceBuffer:
             sequences.append(np.asarray(hds, dtype=np.float32))
         return sequences
     
+    def split_value(self, value: torch.Tensor):
+        """Task and curious values of one critic output (curious is 0 with one head)."""
+        value = value.reshape(-1)
+        return value[0], (value[1] if self.value_heads == 2 else 0.0)
+
     def compute_advantages(
             self,
             discount: float,
@@ -179,16 +202,27 @@ class ExperienceBuffer:
             final_mask: float
         ):
         """Compute advantages using GAE."""
+        next_task, next_curious = self.split_value(next_value)
+        if self.value_heads == 1:
+            rewards = sum(self.all_rewards.values())
+            self._gae(self.values, self.advantages, rewards, self.masks, next_task,
+                      final_mask, discount, gae_lambda)
+            return
+        curious = self.all_rewards.get('curious', torch.zeros_like(self.rewards))
+        task = sum(rew for name, rew in self.all_rewards.items() if name != 'curious')
+        self._gae(self.values, self.advantages, task, self.masks, next_task,
+                  final_mask, discount, gae_lambda)
+        self._gae(self.values_curious, self.advantages_curious, curious,
+                  torch.ones_like(self.masks), next_curious, 1.0, discount, gae_lambda)
+
+    def _gae(self, values, advantages, rewards, masks, next_value, final_mask,
+             discount, gae_lambda):
         for i in reversed(range(self.num_frames)):
-            next_mask = self.masks[i + 1] if i < self.num_frames - 1 else final_mask
-            next_val = self.values[i + 1] if i < self.num_frames - 1 else next_value
-            next_adv = self.advantages[i + 1] if i < self.num_frames - 1 else 0
-            
-            # Augmented reward
-            reward_term = sum(rew[i] for rew in self.all_rewards.values())
-            
-            delta = reward_term + discount * next_val * next_mask - self.values[i]
-            self.advantages[i] = delta + discount * gae_lambda * next_adv * next_mask
+            next_mask = masks[i + 1] if i < self.num_frames - 1 else final_mask
+            next_val = values[i + 1] if i < self.num_frames - 1 else next_value
+            next_adv = advantages[i + 1] if i < self.num_frames - 1 else 0
+            delta = rewards[i] + discount * next_val * next_mask - values[i]
+            advantages[i] = delta + discount * gae_lambda * next_adv * next_mask
     
     def to_dict_list(self, preprocess_fn, device: torch.device) -> DictList:
         """Convert buffer to DictList format for training."""
@@ -200,6 +234,10 @@ class ExperienceBuffer:
         exps.reward = self.rewards
         exps.advantage = self.advantages
         exps.returnn = exps.value + exps.advantage
+        if self.value_heads == 2:
+            exps.value_curious = self.values_curious
+            exps.returnn_curious = self.values_curious + self.advantages_curious
+            exps.advantage = self.advantages + self.advantages_curious
         exps.log_prob = self.log_probs
         
         return exps
@@ -222,9 +260,11 @@ class MetricsTracker:
         self.episode_num_frames = 0
         self.done_counter = 0
         
-        # History
+        # History.  Returns are kept for task episodes only: exploratory
+        # episodes of a task ramp have their task rewards switched off.
         self.returns = []
         self.num_frames_list = []
+        self.task_episodes = 0
         
         # Location tracking
         # NOTE: specific for Minigrid
@@ -244,10 +284,12 @@ class MetricsTracker:
             return
         self.loc_visits[loc] += 1
     
-    def episode_done(self):
+    def episode_done(self, task: bool = True):
         """Mark episode as done and record metrics."""
         self.done_counter += 1
-        self.returns.append(self.episode_return)
+        if task:
+            self.returns.append(self.episode_return)
+            self.task_episodes += 1
         self.num_frames_list.append(self.episode_num_frames)
         
         # Reset episode metrics
@@ -339,12 +381,17 @@ class PredictivePPOAlgo:
         self.reward_config = reward_config
         self.continuous_actions = isinstance(self.env.action_space, gym.spaces.Box)
         self.log_joint_probabilities = bool(joint_probabilities) and not self.continuous_actions
+        self.value_heads = int(getattr(acmodel, "value_heads", 1))
+        # Environment frames collected so far, which drive the task ramp.  The
+        # training script sets it when a run resumes from a checkpoint.
+        self.total_frames = 0
         
         # Validate configurations
         self._validate_config()
         
         # Initialize components
         self._setup_environment()
+        self._start_episode_task()
         self._setup_models()
         self._setup_spatial_representation()
         self._setup_reward_strategies()
@@ -377,6 +424,78 @@ class PredictivePPOAlgo:
         if self.spatial_config.predictive_net is not None:
             assert (self.config.num_frames % self.spatial_config.predictive_net.seqdur == 0), \
                 "num_frames must be divisible by pRNN sequence duration"
+        if self.value_heads == 2 and not self.reward_config.curious_enabled:
+            raise ValueError(
+                "A separate curious value head needs curious rewards "
+                "(rewards.curious_enabled=true)."
+            )
+        ramp = self._task_ramp()
+        if ramp["initial_probability"] < 1 and self.spatial_config.predictive_net is None:
+            raise ValueError(
+                "Exploratory episodes of a task ramp last SR.predictive_net.seqdur steps "
+                "and need a pRNN configuration."
+            )
+
+    # ------------------------------------------------------------------
+    # Task ramp: exploratory and task episodes
+    # ------------------------------------------------------------------
+
+    def _task_ramp(self) -> Dict[str, float]:
+        """``rewards.task_ramp`` settings; by default every episode is a task episode."""
+        ramp = getattr(self.reward_config, "task_ramp", None)
+        settings = {"initial_probability": 1.0, "start_frame": 0, "end_frame": 0}
+        if ramp is not None:
+            settings.update({key: float(ramp[key]) for key in settings if key in ramp})
+        if not 0 <= settings["initial_probability"] <= 1:
+            raise ValueError("rewards.task_ramp.initial_probability must be in [0, 1].")
+        if settings["end_frame"] < settings["start_frame"]:
+            raise ValueError("rewards.task_ramp.end_frame must not precede start_frame.")
+        return settings
+
+    def task_probability(self) -> float:
+        """Probability that a new episode is a task episode.
+
+        It is ``initial_probability`` until ``start_frame`` collected frames,
+        rises linearly to 1 at ``end_frame``, and is 0 throughout
+        ``rewards.exploration`` mode.
+        """
+        if self.reward_config.exploration:
+            return 0.0
+        ramp = self._task_ramp()
+        if self.total_frames >= ramp["end_frame"]:
+            return 1.0
+        if self.total_frames < ramp["start_frame"]:
+            return ramp["initial_probability"]
+        progress = (self.total_frames - ramp["start_frame"]) / (ramp["end_frame"] - ramp["start_frame"])
+        return ramp["initial_probability"] + (1 - ramp["initial_probability"]) * progress
+
+    def _start_episode_task(self):
+        """Decide whether the starting episode is a task or an exploratory one.
+
+        Exploratory episodes are ``rewards.exploration`` episodes: task
+        rewards and terminations are switched off and the episode ends after
+        ``SR.predictive_net.seqdur`` steps.  Curious rewards are unaffected.
+        """
+        probability = self.task_probability()
+        self.task_episode = probability >= 1 or (
+            probability > 0 and np.random.random() < probability
+        )
+        self._episode_steps = 0
+
+    def resume_at(self, frames: int) -> None:
+        """Continue the task ramp from a checkpoint's frame count."""
+        if int(frames) == self.total_frames:
+            return
+        self.total_frames = int(frames)
+        self._start_episode_task()
+
+    def _exploration_step(self, reward, terminated, truncated):
+        """Apply exploratory-episode rules to one environment step."""
+        self._episode_steps += 1
+        if self.task_episode:
+            return reward, terminated, truncated, False
+        cut = self._episode_steps >= self.spatial_config.predictive_net.seqdur
+        return 0, False, False, cut
     
     def _setup_environment(self):
         """Setup environment-related attributes."""
@@ -450,6 +569,8 @@ class PredictivePPOAlgo:
                 device=self.device,
                 predictions=getattr(self.reward_config, "curious_predictions", "all"),
                 timing=getattr(self.reward_config, "curious_reward_timing", "actor_aligned"),
+                center=getattr(self.reward_config, "curious_centering", False),
+                normalize_std=getattr(self.reward_config, "curious_std_normalization", False),
             )
             logger.info("Curious reward strategy enabled")
         else:
@@ -464,6 +585,7 @@ class PredictivePPOAlgo:
             SR_size=SR_size,
             device=self.device,
             action_space=self.env.action_space,
+            value_heads=self.value_heads,
         )
     
     def _setup_metrics(self):
@@ -587,12 +709,9 @@ class PredictivePPOAlgo:
         new_obs, reward, terminated, truncated, _ = self.env.step(det_action)
         
         # Handle exploration mode
-        if self.reward_config.exploration:
-            reward, terminated, truncated = 0, False, False
-        
-        done = terminated or truncated
-        done = done or (self.reward_config.exploration and 
-                (idx + 1) % self.spatial_config.predictive_net.seqdur == 0)
+        # Exploratory episodes (rewards.exploration, task ramp)
+        reward, terminated, truncated, cut = self._exploration_step(reward, terminated, truncated)
+        done = terminated or truncated or cut
         
         new_loc = self._get_agent_pos()
         current_hd = self._get_hd()
@@ -654,7 +773,7 @@ class PredictivePPOAlgo:
             )
         
         # Record episode metrics
-        self.metrics.episode_done()
+        self.metrics.episode_done(task=self.task_episode)
         terminal_state = None
         if self.spatial_config.past_SR and self.spatial_config.predictive_net:
             # ``self.SR`` is the state produced by the terminal action.  It is
@@ -677,6 +796,7 @@ class PredictivePPOAlgo:
         # (and its HD), so it is initialised only after the reset.
         self.obs = self.env.reset()
         self.SR = self.SR_strategy.initialize_SR(obs=self.obs)
+        self._start_episode_task()
 
         logger.debug(f"Episode ended at step {idx}")
     
@@ -937,6 +1057,15 @@ class PredictivePPOAlgo:
         if self.curious_strategy:
             self._logs_collect["curious_rewards"] = \
             self.experience_buffer.all_rewards['curious'].tolist()
+
+        self.total_frames += self.config.num_frames
+        scalars = {
+            "num_task_episodes": self.metrics.task_episodes,
+            "task_probability": self.task_probability(),
+        }
+        if self.curious_strategy is not None and self.curious_strategy.raw_rewards is not None:
+            scalars["cur_reward_raw_mean"] = self.curious_strategy.raw_rewards.mean().item()
+        self._logs_collect["scalars"] = scalars
         
         logger.debug(f"Collected {self.config.num_frames} frames, "
                     f"{self.metrics.done_counter} pRNN trajectories")
@@ -964,13 +1093,15 @@ class PredictivePPOAlgo:
                            1.0 + self.config.clip_eps) * sb.advantage
         policy_loss = -torch.min(surr1, surr2).mean()
         
-        # Value loss (clipped)
-        value_clipped = sb.value + torch.clamp(
-            value - sb.value, -self.config.clip_eps, self.config.clip_eps
-        )
-        surr1 = (value - sb.returnn).pow(2)
-        surr2 = (value_clipped - sb.returnn).pow(2)
-        value_loss = torch.max(surr1, surr2).mean()
+        # Value loss (clipped), summed over the task and curious heads
+        if self.value_heads == 2:
+            value, value_curious = value[:, 0], value[:, 1]
+            value_loss = (
+                self._clipped_value_loss(value, sb.value, sb.returnn)
+                + self._clipped_value_loss(value_curious, sb.value_curious, sb.returnn_curious)
+            )
+        else:
+            value_loss = self._clipped_value_loss(value, sb.value, sb.returnn)
         
         # KL divergence from policy prior
         if self.policy_prior is not None:
@@ -994,8 +1125,17 @@ class PredictivePPOAlgo:
             'value_loss': value_loss.item(),
             'prior_kl': prior_kl.item()
         }
+        if self.value_heads == 2:
+            metrics['value_curious'] = value_curious.mean().item()
         
         return loss, metrics
+
+    def _clipped_value_loss(self, value, old_value, returns) -> torch.Tensor:
+        """PPO's clipped value loss for one value head."""
+        value_clipped = old_value + torch.clamp(
+            value - old_value, -self.config.clip_eps, self.config.clip_eps
+        )
+        return torch.max((value - returns).pow(2), (value_clipped - returns).pow(2)).mean()
     
     def _get_batches_starting_indexes(self) -> List[np.ndarray]:
         """
@@ -1075,6 +1215,8 @@ class PredictivePPOAlgo:
             'prior_kl': [],
             'grad_norm': []
         }
+        if self.value_heads == 2:
+            all_metrics['value_curious'] = []
         
         for epoch in range(self.config.epochs):
             for batch_inds in self._get_batches_starting_indexes():
@@ -1148,7 +1290,8 @@ class PredictivePPOAlgo:
             for key, value in num_frames_per_episode.items():
                 processed[f"steps_per_trial_{key}"] = value
         
-        if "return_per_episode" in logs_collect:
+        # Task episodes only; a rollout of exploratory episodes has none
+        if logs_collect.get("return_per_episode"):
             return_per_episode = synthesize(logs_collect["return_per_episode"], signs=True)
             for key, value in return_per_episode.items():
                 processed[f"return_{key}"] = value
@@ -1197,9 +1340,12 @@ class PredictivePPOAlgo:
                 processed[key] = logs_collect[key]
         
         # Add metrics from update_parameters
-        for key in ["entropy", "policy_loss", "value_loss", "prior_kl", "grad_norm"]:
+        for key in ["entropy", "policy_loss", "value_loss", "prior_kl", "grad_norm", "value_curious"]:
             if key in logs_update:
                 processed[key] = logs_update[key]
+
+        # Scalars of the task ramp, curious scaling and goal pools
+        processed.update(logs_collect.get("scalars", {}))
         
         # Compute mutual information if joint distribution is available
         if "joint_dist" in logs_collect:
@@ -1304,21 +1450,26 @@ class GoalConditionedPPOAlgo(PredictivePPOAlgo):
     """
     Goal-conditioned extension of PredictivePPOAlgo.
 
-    At the start of every ``collect_experiences`` call a goal SR is drawn from
-    *goal_pool* via *goal_strategy* (defaults to :class:`RandomGoalStrategy`).
-    The same goal is re-drawn after each episode ends within the rollout.
+    Every task episode draws a goal from *goal_pool* (an
+    :class:`~RLutils.goals.GoalPool`); it stays until the episode ends, also
+    across rollout boundaries.  Exploratory episodes of a task ramp have no
+    goal: the actor receives a zero goal and there is no goal or internal
+    reward.
 
-    The goal SR is:
-    * Set as the reference of the ``InternalRewardStrategy`` so that
-      distance-based internal rewards track progress toward the goal.
+    The goal state is:
     * Concatenated to the current SR and passed to ``ACModelSR`` as its ``SR``
       argument.  The model must therefore be constructed with
       ``SR_size = raw_SR_size + goal_SR_size``.
+    * The reference of each action's internal (distance-based) reward.
 
-    A terminal bonus reward is issued when the agent's new SR is closer than
-    *goal_threshold* (cosine distance) to the goal:
-    * ``past_SR=False`` -> +1 added to the **current** step's reward.
-    * ``past_SR=True``  -> +1 added to the **previous** step's reward.
+    The goal is reached at its location (``check_location``) or when the new
+    SR's cosine distance to it falls below the goal threshold.  The +1 goal
+    reward goes to the **current** step's reward (``past_SR=False``) or the
+    **previous** step's (``past_SR=True``).  The threshold is a fixed value or
+    an :class:`~RLutils.goals.AdaptiveGoalThreshold`, updated with the
+    distance to the goal at every step of a goal episode.
+
+    ``learn_goals=False`` (validation) leaves the pool and threshold unchanged.
     """
 
     def __init__(
@@ -1329,11 +1480,11 @@ class GoalConditionedPPOAlgo(PredictivePPOAlgo):
         ppo_config: DictConfig,
         spatial_config: DictConfig,
         reward_config: DictConfig,
-        goal_pool: Dict,
-        goal_threshold: float,
-        goal_strategy: Optional[GoalSelectionStrategy] = None,
+        goal_pool: GoalPool | Dict,
+        goal_threshold: float | AdaptiveGoalThreshold,
         check_location: bool = False,
         exclude_loactions: Optional[np.ndarray] = None,
+        learn_goals: bool = True,
         video_log_freq: Optional[int] = None,
         video_folder: Optional[str] = None,
         video_ext: str = '',
@@ -1343,10 +1494,10 @@ class GoalConditionedPPOAlgo(PredictivePPOAlgo):
     ):
         """
         Args:
-            goal_pool:       Tensor of candidate goal SRs  [n_goals, SR_dim].
-            goal_threshold:  Cosine-distance threshold for reaching a goal.
-            goal_strategy:   How to pick a goal from the pool.
-                             Defaults to :class:`RandomGoalStrategy`.
+            goal_pool:       Goal source, or a random-walk recording (dict with
+                             ``h`` and ``state``) sampled visit by visit.
+            goal_threshold:  Cosine-distance threshold for reaching a goal,
+                             fixed or adaptive.
             exclude_loactions: Optional 2xN numpy array of excluded goal
                                coordinates where each column is [x, y].
             video_trigger:   Optional episode-index -> bool rule (e.g.
@@ -1354,46 +1505,25 @@ class GoalConditionedPPOAlgo(PredictivePPOAlgo):
                              every-``video_log_freq``-episodes recording.
             (other args):    Forwarded to :class:`PredictivePPOAlgo`.
         """
-        # Store goal pool early so _setup_experience_buffer can use it.
-        # device is resolved inside super().__init__; store raw tensor for now.
-        self._goal_pool_raw, self._goal_locs = _align_goal_pool(goal_pool)
-        self._video_ext = video_ext
-
-        # Optionally filter out excluded goal locations.
-        if exclude_loactions is not None:
-            exclude_arr = np.asarray(exclude_loactions)
-            if exclude_arr.ndim != 2 or exclude_arr.shape[0] != 2:
-                raise ValueError(
-                    "exclude_loactions must be a 2xN numpy array "
-                    "with columns [x, y]."
-                )
-
-            excluded = {
-                (int(exclude_arr[0, i]), int(exclude_arr[1, i]))
-                for i in range(exclude_arr.shape[1])
-            }
-            keep_mask_np = np.array(
-                [tuple(map(int, loc)) not in excluded for loc in self._goal_locs],
-                dtype=bool,
+        if isinstance(goal_pool, dict):
+            goal_pool = StateGoalPool.from_recording(*_align_goal_pool(goal_pool))
+        if check_location and not goal_pool.has_locations:
+            raise ValueError(
+                "This goal pool's goals have no location; check goals by representation "
+                "(check_location=false)."
             )
+        self._excluded = excluded_locations(exclude_loactions)
+        if self._excluded and not goal_pool.has_locations:
+            raise ValueError("This goal pool's goals have no location to exclude.")
+        if isinstance(goal_pool, StateGoalPool):
+            goal_pool.allowed(self._excluded)  # fail early if every goal is excluded
 
-            if not keep_mask_np.any():
-                raise ValueError(
-                    "All goal locations were excluded. "
-                    "Provide a less restrictive exclude_loactions set."
-                )
-
-            self._goal_locs = self._goal_locs[keep_mask_np]
-
-            if isinstance(self._goal_pool_raw, torch.Tensor):
-                keep_mask = torch.as_tensor(keep_mask_np, device=self._goal_pool_raw.device)
-                self._goal_pool_raw = self._goal_pool_raw[:, keep_mask]
-            else:
-                self._goal_pool_raw = np.asarray(self._goal_pool_raw)[:, keep_mask_np]
-
+        self.goal_pool = goal_pool
         self.goal_threshold = goal_threshold
-        self.goal_strategy = goal_strategy or RandomGoalStrategy()
         self.check_location = check_location
+        self.learn_goals = learn_goals
+        self._goals_unavailable = 0
+        self._video_ext = video_ext
         self.video_log_freq = int(video_log_freq) if video_log_freq is not None else 0
         self.video_folder = video_folder
         self.video_trigger = video_trigger
@@ -1415,37 +1545,83 @@ class GoalConditionedPPOAlgo(PredictivePPOAlgo):
             device=device, preprocess_obss=preprocess_obss,
         )
 
-        # Move pool to the resolved device and re-init experience buffer at the
-        # correct (doubled) SR size.
-        self.goal_pool = self._goal_pool_raw.to(self.device)
+        if isinstance(self.goal_pool, StateGoalPool):
+            self.goal_pool.to(self.device)
 
+        # Re-init the experience buffer at the goal-conditioned (doubled) SR size.
         raw_SR_size = self.SR_strategy.get_SR_size(self.SR)
+        self._no_goal = torch.zeros((1, raw_SR_size), device=self.device)
         self.experience_buffer = ExperienceBuffer(
             num_frames=self.config.num_frames,
             SR_size=raw_SR_size * 2,
             device=self.device,
             action_space=self.env.action_space,
-        )
-
-        # InternalRewardStrategy is required for goal-reaching checks.
-        assert self.internal_strategy is not None or self.check_location, (
-            "To check goal-reaching, either internal rewards must be enabled or check_location=True must be set."
+            value_heads=self.value_heads,
         )
 
         # Select and apply the first goal.
-        self._select_goal()
+        self._set_new_goal()
+        self._current_episode_start_distance = self._compute_goal_start_distance()
+        self._episode_goal_reached = False
         logger.info("GoalConditionedPPOAlgo initialised")
 
     # ------------------------------------------------------------------
     # Goal management
     # ------------------------------------------------------------------
 
-    def _select_goal(self) -> torch.Tensor:
-        """Draw a new goal from the pool using the configured strategy."""
-        self.goal, idx = self.goal_strategy.select_goal(self.goal_pool)
-        self.goal_loc = self._goal_locs[idx]
-        if self.internal_strategy:
-            self.internal_strategy.set_reference(self.goal)
+    def resume_at(self, frames: int) -> None:
+        """Continue the task ramp from a checkpoint, redrawing the first goal."""
+        if int(frames) == self.total_frames:
+            return
+        super().resume_at(frames)
+        self._set_new_goal()
+        self._current_episode_start_distance = self._compute_goal_start_distance()
+
+    @property
+    def threshold(self) -> float:
+        """Current cosine-distance threshold for reaching a goal."""
+        if isinstance(self.goal_threshold, AdaptiveGoalThreshold):
+            return self.goal_threshold.value
+        return float(self.goal_threshold)
+
+    @property
+    def _adapts_threshold(self) -> bool:
+        return self.learn_goals and isinstance(self.goal_threshold, AdaptiveGoalThreshold)
+
+    def _waking_state(self) -> torch.Tensor:
+        """pRNN state of the current observation, leaving RL's pRNN state as it was."""
+        if not isinstance(self.SR_strategy, PredictiveNetworkSR):
+            raise ValueError("A waking state needs a pRNN spatial representation.")
+        predictive_net = self.predictiveNet
+        saved_state, saved_phase = predictive_net.state, predictive_net.phase
+        try:
+            predictive_net.reset_state(device=self.device)
+            # The current-SR initial state: this observation with no action
+            return PredictiveNetworkSR.initialize_SR(self.SR_strategy, self.obs)
+        finally:
+            predictive_net.state, predictive_net.phase = saved_state, saved_phase
+
+    def _goal_distance(self, state: torch.Tensor) -> float:
+        """Cosine distance between a pRNN state and the goal."""
+        return float(cosine(
+            state.detach().cpu().reshape(-1).numpy(),
+            self.goal.detach().cpu().reshape(-1).numpy(),
+        ))
+
+    def _set_new_goal(self) -> None:
+        """Give the starting episode a goal, or none if it is exploratory."""
+        goal = None
+        if self.task_episode:
+            goal = self.goal_pool.sample(self._excluded, waking_state=self._waking_state)
+            if goal is None:
+                # An online pool has no eligible goal yet: explore instead.
+                self._goals_unavailable += 1
+                self.task_episode = False
+        if goal is None:
+            self.goal, self.goal_loc = self._no_goal, None
+            return
+        self.goal = goal.state.to(self.device)
+        self.goal_loc = goal.location
 
     def _should_record_current_episode(self) -> bool:
         """Whether the current episode should be recorded."""
@@ -1487,13 +1663,10 @@ class GoalConditionedPPOAlgo(PredictivePPOAlgo):
         """Every episode can reach its goal, which pays a reward of one."""
         return 1.0
 
-    def _set_new_goal(self) -> None:
-        """Select a new goal from the pool and update the internal strategy."""
-        self._select_goal()
-        logger.debug("New goal selected")
-
-    def _compute_goal_start_distance(self) -> float:
-        """Compute Euclidean distance between current location and goal location."""
+    def _compute_goal_start_distance(self) -> Optional[float]:
+        """Euclidean distance between the current and goal locations, if known."""
+        if self.goal_loc is None:
+            return None
         current_loc = np.asarray(self._get_agent_pos(), dtype=np.float32)
         goal_loc = np.asarray(self.goal_loc, dtype=np.float32)
         return float(np.linalg.norm(current_loc - goal_loc))
@@ -1503,6 +1676,18 @@ class GoalConditionedPPOAlgo(PredictivePPOAlgo):
             return 1.0, True
         else:
             return 0.0, False
+
+    def _check_goal_state(self, SR_new: torch.Tensor) -> Tuple[float, Optional[float], bool]:
+        """Goal check by representation: ``(reward_new, reward_past, reached)``."""
+        distance = self._goal_distance(SR_new)
+        reached = distance < self.threshold
+        if self._adapts_threshold:
+            self.goal_threshold.update(distance)
+        if not reached:
+            return 0.0, None, False
+        if self.spatial_config.past_SR:
+            return 0.0, 1.0, True
+        return 1.0, None, True
 
     # ------------------------------------------------------------------
     # Overrides
@@ -1522,9 +1707,8 @@ class GoalConditionedPPOAlgo(PredictivePPOAlgo):
 
     def _collect_single_step(self, idx: int) -> Tuple[StepData, bool]:
         """
-        Collect one step.  Checks for goal reaching and issues a terminal
-        bonus reward when the cosine distance between the new SR and the goal
-        drops below *goal_threshold*.
+        Collect one step.  In a goal episode, checks for goal reaching and
+        issues a terminal bonus reward.
         """
         self._ensure_episode_video_recorder()
 
@@ -1536,14 +1720,9 @@ class GoalConditionedPPOAlgo(PredictivePPOAlgo):
         if self._video_recorder is not None:
             self._video_recorder.capture_frame()
 
-        if self.reward_config.exploration:
-            reward, terminated, truncated = 0, False, False
-
-        done = terminated or truncated
-        done = done or (
-            self.reward_config.exploration
-            and (idx + 1) % self.spatial_config.predictive_net.seqdur == 0
-        )
+        # Exploratory episodes (rewards.exploration, task ramp) have no goal
+        reward, terminated, truncated, cut = self._exploration_step(reward, terminated, truncated)
+        done = terminated or truncated or cut
 
         new_loc = self._get_agent_pos()
         current_hd = self._get_hd()
@@ -1556,21 +1735,21 @@ class GoalConditionedPPOAlgo(PredictivePPOAlgo):
                 self._hd_for_spatial_representation(past_hd, current_hd)
             ),
         )
+        if self.learn_goals:
+            # SR_new represents the observation fed to the pRNN with this action
+            self.goal_pool.observe(SR_new, self.loc if self.spatial_config.past_SR else new_loc)
 
         # --- Goal-reaching check -----------------------------------------
-        if self.check_location:
-            reward_new, goal_reached = self._check_goal(new_loc)
-            reward_past = None  # not used when check_location is True
-        else:
-            reward_new, reward_past, goal_reached = self.internal_strategy.check_goal(
-                SR_new=SR_new,
-                goal_threshold=self.goal_threshold,
-                past_SR=self.spatial_config.past_SR,
-            )
-        reward += reward_new
-        done = done or goal_reached
-        if goal_reached:
-            self._episode_goal_reached = True
+        reward_past = None
+        if self.task_episode:
+            if self.check_location:
+                reward_new, goal_reached = self._check_goal(new_loc)
+            else:
+                reward_new, reward_past, goal_reached = self._check_goal_state(SR_new)
+            reward += reward_new
+            done = done or goal_reached
+            if goal_reached:
+                self._episode_goal_reached = True
 
         # Store goal-conditioned SR so training uses the same representation
         # that was used for action selection.
@@ -1588,6 +1767,7 @@ class GoalConditionedPPOAlgo(PredictivePPOAlgo):
             mask=self.mask,
             reward_past=reward_past,
             SR_next=SR_new,
+            hd=past_hd,
         )
 
         # Update state
@@ -1600,8 +1780,8 @@ class GoalConditionedPPOAlgo(PredictivePPOAlgo):
 
     def _handle_episode_end(self, idx: int) -> None:
         """Handle episode end AND select a fresh goal for the next episode."""
-        # Log the starting distance of the episode that just ended.
-        if self._current_episode_start_distance is not None:
+        # Log the starting distance of the goal episode that just ended.
+        if self.task_episode and self._current_episode_start_distance is not None:
             if self._episode_goal_reached:
                 self._distances_success.append(self._current_episode_start_distance)
             else:
@@ -1610,29 +1790,19 @@ class GoalConditionedPPOAlgo(PredictivePPOAlgo):
         self._stop_episode_video_recorder()
 
         super()._handle_episode_end(idx)
-        self._set_new_goal()
 
         # super()._handle_episode_end resets the env, so refresh current location.
         self.loc = self._get_agent_pos()
+        self._set_new_goal()
         self._current_episode_start_distance = self._compute_goal_start_distance()
         self._episode_goal_reached = False
         self._episode_counter += 1
 
     def collect_experiences(self) -> DictList:
-        """
-        Collect rollouts.
-
-        Selects a fresh goal at the very start of the collection window so
-        that the first episode always has a well-defined goal even when the
-        collector is called for the first time.
-        """
+        """Collect rollouts; an unfinished episode keeps its goal into the next one."""
         self._distances_success = []
         self._distances_fail = []
-        self._episode_goal_reached = False
         self._stop_episode_video_recorder()
-
-        self._set_new_goal()
-        self._current_episode_start_distance = self._compute_goal_start_distance()
 
         try:
             exps = super().collect_experiences()
@@ -1641,6 +1811,10 @@ class GoalConditionedPPOAlgo(PredictivePPOAlgo):
 
         self._logs_collect["distances_success"] = self._distances_success
         self._logs_collect["distances_fail"] = self._distances_fail
+        scalars = self._logs_collect.setdefault("scalars", {})
+        scalars.update(self.goal_pool.stats())
+        scalars["goal_threshold"] = self.threshold
+        scalars["goals_unavailable"] = self._goals_unavailable
 
         return exps
 
@@ -1649,19 +1823,18 @@ class GoalConditionedPPOAlgo(PredictivePPOAlgo):
         Compute augmented rewards.
 
         The experience buffer stores goal-conditioned SRs
-        (shape ``[num_frames, raw_SR_size + goal_SR_size]``).
-        The internal strategy operates on *raw* SRs only, so we strip the
-        goal suffix before calling ``compute_rewards``.
+        (shape ``[num_frames, raw_SR_size + goal_SR_size]``).  Internal rewards
+        use the raw SRs, each with the goal active at that action as reference
+        (a zero goal in exploratory episodes gives no internal reward).
         """
         # --- Internal (proximity) rewards --------------------------------
         if self.internal_strategy:
             raw_sr_size = self.SR.shape[1]          # self.SR is always the raw SR
-            raw_SRs, next_raw_SRs = self._internal_reward_state_pairs(
-                self.experience_buffer.SRs[:, :raw_sr_size]
-            )
+            stored = self.experience_buffer.SRs
+            raw_SRs, next_raw_SRs = self._internal_reward_state_pairs(stored[:, :raw_sr_size])
 
             internal_rewards = self.internal_strategy.compute_rewards(
-                SRs=raw_SRs, next_SRs=next_raw_SRs
+                SRs=raw_SRs, next_SRs=next_raw_SRs, references=stored[:, raw_sr_size:]
             )
             self.experience_buffer.store_rewards("internal", internal_rewards)
 
@@ -1689,10 +1862,12 @@ class GoalConditionedPPOAlgo(PredictivePPOAlgo):
 class VisualGoalConditionedPPOAlgo(PredictivePPOAlgo):
     """Goal-conditioned PPO for visual baselines without a pRNN input.
 
-    A goal is an integer grid location sampled from a pre-collected pool. The
-    actor-critic receives the visual observation and a separate
-    ``onehot(goal_x) || onehot(goal_y)`` input. Reaching the selected location
-    terminates the episode and adds a terminal reward of one. This intentionally
+    A goal is an integer grid location from a
+    :class:`~RLutils.goals.LocationGoalPool`; it lasts its whole episode, also
+    across rollout boundaries. The actor-critic receives the visual
+    observation and a separate ``onehot(goal_x) || onehot(goal_y)`` input.
+    Reaching the selected location terminates the episode and adds a terminal
+    reward of one. This intentionally
     remains independent of ``GoalConditionedPPOAlgo``, whose goal, experience
     buffer, and reward semantics are defined in pRNN spatial-representation
     space.
@@ -1705,8 +1880,7 @@ class VisualGoalConditionedPPOAlgo(PredictivePPOAlgo):
         ppo_config: DictConfig,
         spatial_config: DictConfig,
         reward_config: DictConfig,
-        goal_pool,
-        goal_strategy: Optional[GoalSelectionStrategy] = None,
+        goal_pool: LocationGoalPool | np.ndarray,
         exclude_locations: Optional[np.ndarray] = None,
         video_log_freq: Optional[int] = None,
         video_folder: Optional[str] = None,
@@ -1715,16 +1889,14 @@ class VisualGoalConditionedPPOAlgo(PredictivePPOAlgo):
         device: Optional[torch.device] = None,
         preprocess_obss=None,
     ):
-        self.goal_width = int(env.width)
-        self.goal_height = int(env.height)
-        self.goal_size = self.goal_width + self.goal_height
-        self._goal_pool_raw = self._validate_location_pool(goal_pool)
-        self._goal_pool_raw = self._exclude_locations(
-            self._goal_pool_raw, exclude_locations
-        )
-        self.goal_strategy = goal_strategy or RandomLocationGoalStrategy(
-            self.goal_width, self.goal_height, device or torch.device("cpu")
-        )
+        if not isinstance(goal_pool, LocationGoalPool):
+            goal_pool = LocationGoalPool(goal_pool, int(env.width), int(env.height))
+        if (goal_pool.width, goal_pool.height) != (int(env.width), int(env.height)):
+            raise ValueError("The location goal pool's grid does not match the environment.")
+        self.goal_pool = goal_pool
+        self.goal_size = goal_pool.goal_size
+        self._excluded = excluded_locations(exclude_locations)
+        goal_pool.allowed(self._excluded)  # fail early if every goal is excluded
         self.video_log_freq = int(video_log_freq) if video_log_freq is not None else 0
         self.video_folder = video_folder
         self._video_ext = video_ext
@@ -1758,14 +1930,15 @@ class VisualGoalConditionedPPOAlgo(PredictivePPOAlgo):
                 "Actor-critic location-goal input size does not match the environment: "
                 f"expected {self.goal_size}."
             )
-        self.goal_pool = self._goal_pool_raw
         self.experience_buffer = ExperienceBuffer(
             num_frames=self.config.num_frames,
             SR_size=self.goal_size,
             device=self.device,
             action_space=self.env.action_space,
         )
-        self._select_goal()
+        self._set_new_goal()
+        self._current_episode_start_distance = self._compute_goal_start_distance()
+        self._episode_goal_reached = False
         logger.info("VisualGoalConditionedPPOAlgo initialised")
 
     def _validate_config(self):
@@ -1793,6 +1966,8 @@ class VisualGoalConditionedPPOAlgo(PredictivePPOAlgo):
                 "Visual location-goal PPO has no predictive network; "
                 "set rewards.curious_enabled=false."
             )
+        if self._task_ramp()["initial_probability"] < 1:
+            raise ValueError("Visual location-goal PPO does not support a task ramp.")
 
     def _setup_reward_strategies(self):
         """Location goals use only environment reward plus the terminal bonus."""
@@ -1809,53 +1984,10 @@ class VisualGoalConditionedPPOAlgo(PredictivePPOAlgo):
         self.SR_strategy = NoSpatialRepresentation(self.device)
         self.SR = self.SR_strategy.initialize_SR(obs=self.obs)
 
-    def _validate_location_pool(self, goal_pool) -> np.ndarray:
-        locations = np.asarray(goal_pool)
-        if locations.ndim != 2 or locations.shape[1] != 2 or len(locations) == 0:
-            raise ValueError(
-                "Location goal pool must have shape (num_goals, 2) with at least one goal."
-            )
-        rounded = np.rint(locations).astype(int)
-        if not np.allclose(locations, rounded):
-            raise ValueError("Location goal pools must contain integer grid coordinates.")
-        in_bounds = (
-            (rounded[:, 0] >= 0)
-            & (rounded[:, 0] < self.goal_width)
-            & (rounded[:, 1] >= 0)
-            & (rounded[:, 1] < self.goal_height)
-        )
-        if not in_bounds.all():
-            raise ValueError("Location goal pool contains coordinates outside the environment grid.")
-        return rounded
-
-    @staticmethod
-    def _exclude_locations(
-        locations: np.ndarray, exclude_locations: Optional[np.ndarray]
-    ) -> np.ndarray:
-        if exclude_locations is None:
-            return locations
-        excluded_array = np.asarray(exclude_locations)
-        if excluded_array.ndim != 2 or excluded_array.shape[0] != 2:
-            raise ValueError(
-                "exclude_locations must have shape (2, num_locations)."
-            )
-        excluded = {tuple(location) for location in excluded_array.T.astype(int)}
-        selected = np.asarray(
-            [location for location in locations if tuple(location) not in excluded],
-            dtype=int,
-        )
-        if len(selected) == 0:
-            raise ValueError("All collected location goals were excluded.")
-        return selected
-
-    def _select_goal(self) -> torch.Tensor:
-        self.goal, idx = self.goal_strategy.select_goal(self.goal_pool)
-        self.goal = self.goal.to(self.device)
-        self.goal_loc = self.goal_pool[idx].copy()
-        return self.goal
-
     def _set_new_goal(self) -> None:
-        self._select_goal()
+        goal = self.goal_pool.sample(self._excluded)
+        self.goal = goal.state.to(self.device)
+        self.goal_loc = goal.location
         logger.debug("New visual location goal selected")
 
     def _should_record_current_episode(self) -> bool:
@@ -1959,12 +2091,10 @@ class VisualGoalConditionedPPOAlgo(PredictivePPOAlgo):
         self._episode_counter += 1
 
     def collect_experiences(self) -> DictList:
+        """Collect rollouts; an unfinished episode keeps its goal into the next one."""
         self._distances_success = []
         self._distances_fail = []
-        self._episode_goal_reached = False
         self._stop_episode_video_recorder()
-        self._set_new_goal()
-        self._current_episode_start_distance = self._compute_goal_start_distance()
         try:
             exps = super().collect_experiences()
         finally:

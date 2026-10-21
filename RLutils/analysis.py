@@ -210,6 +210,8 @@ class EnvironmentFeaturesAnalysis:
 
             prob = dist.probs
             probs.append(prob.to('cpu').numpy().squeeze())
+            if value.ndim == 2:  # task and curious heads: map the task value
+                value = value[:, 0]
             values.append(value.to('cpu').numpy())
 
         return np.array(probs), np.array(values)

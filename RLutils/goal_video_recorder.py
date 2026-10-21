@@ -6,18 +6,24 @@ from gymnasium.wrappers.monitoring.video_recorder import VideoRecorder
 
 
 class GoalMarkedVideoRecorder(VideoRecorder):
-    """Video recorder that overlays a green star at a configured goal location."""
+    """Video recorder that overlays a green star at a configured goal location.
+
+    Goals without a location (e.g. spontaneous-activity goals) or exploratory
+    episodes without a goal pass ``goal_location=None``: no marker is drawn.
+    """
 
     def __init__(
         self,
         env,
-        goal_location: Sequence[int],
+        goal_location: Optional[Sequence[int]],
         grid_shape: Optional[Tuple[int, int]] = None,
         marker_color: Tuple[int, int, int] = (57, 158, 118),
         marker_scale: float = 0.35,
         **kwargs,
     ):
-        self.goal_location = (int(goal_location[0]), int(goal_location[1]))
+        self.goal_location = (
+            None if goal_location is None else (int(goal_location[0]), int(goal_location[1]))
+        )
         self.grid_shape = grid_shape
         self.marker_color = marker_color
         self.marker_scale = marker_scale
@@ -60,7 +66,7 @@ class GoalMarkedVideoRecorder(VideoRecorder):
         out = np.array(frame, copy=True)
         if out.ndim == 2:
             out = np.repeat(out[..., None], 3, axis=2)
-        if out.ndim != 3 or out.shape[2] < 3:
+        if out.ndim != 3 or out.shape[2] < 3 or self.goal_location is None:
             return out
 
         if self.grid_shape is not None:
