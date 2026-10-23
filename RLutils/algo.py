@@ -217,12 +217,21 @@ class ExperienceBuffer:
 
     def _gae(self, values, advantages, rewards, masks, next_value, final_mask,
              discount, gae_lambda):
+        # TD errors and decays are computed for all steps at once; only the
+        # backward recursion is sequential, and it runs over host float32
+        # values, so the result is bitwise the per-step tensor computation.
+        next_values = torch.cat((values[1:], torch.as_tensor(
+            next_value, dtype=values.dtype, device=values.device).reshape(1)))
+        next_masks = torch.cat((masks[1:], torch.as_tensor(
+            final_mask, dtype=masks.dtype, device=masks.device).reshape(1)))
+        deltas = (rewards + discount * next_values * next_masks - values).cpu().numpy()
+        decays = (discount * gae_lambda * next_masks).cpu().numpy()
+        result = np.empty_like(deltas)
+        running = np.float32(0)
         for i in reversed(range(self.num_frames)):
-            next_mask = masks[i + 1] if i < self.num_frames - 1 else final_mask
-            next_val = values[i + 1] if i < self.num_frames - 1 else next_value
-            next_adv = advantages[i + 1] if i < self.num_frames - 1 else 0
-            delta = rewards[i] + discount * next_val * next_mask - values[i]
-            advantages[i] = delta + discount * gae_lambda * next_adv * next_mask
+            running = deltas[i] + decays[i] * running
+            result[i] = running
+        advantages.copy_(torch.from_numpy(result))
     
     def to_dict_list(self, preprocess_fn, device: torch.device) -> DictList:
         """Convert buffer to DictList format for training."""
@@ -944,8 +953,13 @@ class PredictivePPOAlgo:
             )
         return aligned_SRs
     
-    def _compute_joint_probabilities(self) -> np.ndarray:
-        """Compute joint probability distribution over states and actions."""
+    def _compute_joint_probabilities(self, action_probs: List[torch.Tensor]) -> np.ndarray:
+        """Joint distribution over states and actions of the rollout's policy.
+
+        ``action_probs`` are the action probabilities recorded at action
+        selection.  The actor-critic is not updated during collection, so
+        they are the rollout's policy at every visited state.
+        """
         joint_probs = np.zeros(
             (getattr(self.env, "numHDs"),
              self.env.width,
@@ -953,25 +967,12 @@ class PredictivePPOAlgo:
              getattr(self.acmodel, "act_dim")),
             dtype=np.float32
         )
-        
-        # Recompute distributions for all states
-        with torch.no_grad():
-            for i in range(self.config.num_frames):
-                dist, _ = self.acmodel(
-                    self.preprocess_obss([self.experience_buffer.obss[i]], device=self.device),
-                    SR=self.experience_buffer.SRs[i:i+1]
-                )
-                
-                # Get HD and location
-                try:
-                    hd = self.experience_buffer.obss[i]["direction"]
-                except KeyError:
-                    hd = self.experience_buffer.obss[i]["HD"]
-                
-                x, y = self.experience_buffer.locs[i]
-                act_probs = dist.probs.detach().cpu().numpy().squeeze()
-                joint_probs[hd, x, y, :] += act_probs
-        
+        obss = self.experience_buffer.obss
+        hd_key = "direction" if "direction" in obss[0] else "HD"
+        hds = [obs[hd_key] for obs in obss]
+        xs, ys = zip(*self.experience_buffer.locs)
+        # In-order accumulation, as a loop over the steps would add them
+        np.add.at(joint_probs, (hds, xs, ys), torch.cat(action_probs).cpu().numpy())
         return joint_probs
     
     def collect_experiences(self) -> DictList:
@@ -989,13 +990,16 @@ class PredictivePPOAlgo:
         
         # Collect experiences
         any_done = False
+        action_probs = []
         for i in range(self.config.num_frames):
             # Collect single step
             step_data, done = self._collect_single_step(i)
-            
+
             # Store in buffer
             self.experience_buffer.store_step(i, step_data)
-            
+            if self.log_joint_probabilities:
+                action_probs.append(step_data.dist.probs)
+
             # Update metrics
             self.metrics.update_step(step_data.reward, step_data.reward_past)
             self.metrics.update_location_visit(step_data.loc)
@@ -1034,7 +1038,9 @@ class PredictivePPOAlgo:
         # Compute metrics
         loc_entropy, loc_entropy_5 = self.metrics.compute_location_entropy()
         returns, num_frames = self.metrics.get_episode_logs()
-        joint_probs = self._compute_joint_probabilities() if self.log_joint_probabilities else None
+        joint_probs = (
+            self._compute_joint_probabilities(action_probs) if self.log_joint_probabilities else None
+        )
         
         # Store logs
         self._logs_collect = {

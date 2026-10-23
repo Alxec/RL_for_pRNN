@@ -17,6 +17,7 @@ from minigrid.wrappers import (
     SymbolicObsWrapper,
     ViewSizeWrapper,
 )
+from minigrid.core.world_object import WorldObj
 from collections import deque
 from functools import partial
 
@@ -179,7 +180,7 @@ def make_minigrid_env(
 
     elif spatial_config.predictive_net or 'PO' in input_type:
         # The same RGB wrapper is used for comparability whenever partial observation is needed
-        env = RGBImgPartialObsWrapper_HD_Farama(env, tile_size=1)
+        env = BankedRGBImgPartialObsWrapper(env, tile_size=1)
     
     else:
         # For the cases without any visual input
@@ -297,6 +298,96 @@ class HDObsWrapper(ObservationWrapper):
         return {
             'mission': obs['mission'],
             'HD': obs['direction']
+        }
+
+
+# Rendered views shared by every environment of the process, keyed by
+# BankedRGBImgPartialObsWrapper._bank_key.
+_OBSERVATION_BANKS = {}
+# More distinct grids than this mean a layout that changes between episodes,
+# for which rendering every view per grid would cost more than it saves.
+_MAX_OBSERVATION_BANKS = 8
+
+
+class BankedRGBImgPartialObsWrapper(RGBImgPartialObsWrapper_HD_Farama):
+    """``RGBImgPartialObsWrapper_HD_Farama`` with views rendered in advance.
+
+    While the grid is unchanged, the partial view is a function of the
+    agent's position and direction only.  Every ``(x, y, direction)`` view is
+    rendered once, with the parent's own ``get_frame``, and afterwards looked
+    up, so observations are byte-identical to the live render.  A bank is
+    selected whenever the environment installs a new grid (at resets).
+
+    The live render is kept for grids with objects that can be picked up or
+    toggled (the grid could change within an episode), while the agent
+    carries an object, and for grids beyond ``_MAX_OBSERVATION_BANKS``.
+    """
+
+    def __init__(self, env, tile_size=8):
+        super().__init__(env, tile_size=tile_size)
+        self._bank_grid = None
+        self._bank = None
+
+    @staticmethod
+    def _static_grid(grid) -> bool:
+        return not any(
+            cell is not None
+            and (cell.can_pickup() or type(cell).toggle is not WorldObj.toggle)
+            for cell in grid.grid
+        )
+
+    def _bank_key(self):
+        # MiniGrid caches rendered tiles by object encoding, so grids with the
+        # same encoding and object classes render identically.
+        env = self.unwrapped
+        return (
+            env.grid.width, env.grid.height, env.grid.encode().tobytes(),
+            tuple(type(cell).__qualname__ for cell in env.grid.grid),
+            env.agent_view_size, env.see_through_walls, self.tile_size,
+        )
+
+    def _render_bank(self) -> np.ndarray:
+        env = self.unwrapped
+        agent_pos, agent_dir = env.agent_pos, env.agent_dir
+        bank = np.empty(
+            (env.width, env.height, 4, *self.observation_space.spaces['image'].shape),
+            dtype=np.uint8,
+        )
+        try:
+            for x in range(env.width):
+                for y in range(env.height):
+                    for direction in range(4):
+                        env.agent_pos, env.agent_dir = (x, y), direction
+                        bank[x, y, direction] = env.get_frame(
+                            tile_size=self.tile_size, agent_pov=True
+                        )
+        finally:
+            env.agent_pos, env.agent_dir = agent_pos, agent_dir
+        bank.flags.writeable = False
+        return bank
+
+    def _select_bank(self):
+        if not self._static_grid(self.unwrapped.grid):
+            return None
+        key = self._bank_key()
+        if key not in _OBSERVATION_BANKS:
+            if len(_OBSERVATION_BANKS) >= _MAX_OBSERVATION_BANKS:
+                return None
+            _OBSERVATION_BANKS[key] = self._render_bank()
+        return _OBSERVATION_BANKS[key]
+
+    def observation(self, obs):
+        env = self.unwrapped
+        if env.grid is not self._bank_grid:
+            self._bank_grid = env.grid
+            self._bank = self._select_bank()
+        if self._bank is None or env.carrying is not None:
+            return super().observation(obs)
+        x, y = env.agent_pos
+        return {
+            'mission': obs['mission'],
+            'image': self._bank[x, y, env.agent_dir].copy(),
+            'direction': obs['direction'],
         }
 
 
