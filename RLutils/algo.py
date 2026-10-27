@@ -491,8 +491,22 @@ class PredictivePPOAlgo:
         )
         self._episode_steps = 0
 
-    def resume_at(self, frames: int) -> None:
-        """Continue the task ramp from a checkpoint's frame count."""
+    def training_state(self) -> Dict:
+        """What a resumed run needs beyond the networks and the frame count."""
+        state = {"task_episodes": self.metrics.task_episodes}
+        if self.curious_strategy is not None:
+            state["curious_stats"] = self.curious_strategy.previous_stats
+        return state
+
+    def _load_training_state(self, state: Dict) -> None:
+        self.metrics.task_episodes = state.get("task_episodes", 0)
+        if self.curious_strategy is not None:
+            self.curious_strategy.previous_stats = state.get("curious_stats")
+
+    def resume_at(self, frames: int, state: Optional[Dict] = None) -> None:
+        """Continue from a checkpoint: its frame count (task ramp) and :meth:`training_state`."""
+        if state:
+            self._load_training_state(state)
         if int(frames) == self.total_frames:
             return
         self.total_frames = int(frames)
@@ -1575,11 +1589,25 @@ class GoalConditionedPPOAlgo(PredictivePPOAlgo):
     # Goal management
     # ------------------------------------------------------------------
 
-    def resume_at(self, frames: int) -> None:
-        """Continue the task ramp from a checkpoint, redrawing the first goal."""
-        if int(frames) == self.total_frames:
+    def training_state(self) -> Dict:
+        state = super().training_state()
+        state["goal_pool"] = self.goal_pool.state_dict()
+        if isinstance(self.goal_threshold, AdaptiveGoalThreshold):
+            state["goal_threshold"] = self.goal_threshold.value
+        return state
+
+    def _load_training_state(self, state: Dict) -> None:
+        super()._load_training_state(state)
+        if state.get("goal_pool"):
+            self.goal_pool.load_state_dict(state["goal_pool"])
+        if isinstance(self.goal_threshold, AdaptiveGoalThreshold) and "goal_threshold" in state:
+            self.goal_threshold.value = state["goal_threshold"]
+
+    def resume_at(self, frames: int, state: Optional[Dict] = None) -> None:
+        """Continue from a checkpoint, then redraw the first goal from the restored pool."""
+        if int(frames) == self.total_frames and not state:
             return
-        super().resume_at(frames)
+        super().resume_at(frames, state)
         self._set_new_goal()
         self._current_episode_start_distance = self._compute_goal_start_distance()
 

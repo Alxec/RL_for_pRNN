@@ -73,6 +73,13 @@ class GoalPool(ABC):
         """Scalars worth logging."""
         return {}
 
+    def state_dict(self) -> Dict:
+        """What a resumed run needs to continue this pool (online pools only)."""
+        return {}
+
+    def load_state_dict(self, state: Dict) -> None:
+        """Continue from :meth:`state_dict`."""
+
 
 class FixedGoalPool(GoalPool):
     """A fixed set of goals, one per entry of ``locations``, sampled uniformly."""
@@ -222,6 +229,13 @@ class LocationEMAGoalPool(GoalPool):
         else:
             reference = self.references[key]
             reference += max(self.rate, 1 / visits) * (state - reference)
+
+    def state_dict(self) -> Dict:
+        return {"references": self.references, "visits": self.visits}
+
+    def load_state_dict(self, state: Dict) -> None:
+        self.references = {key: value.clone() for key, value in state["references"].items()}
+        self.visits = dict(state["visits"])
 
     def eligible(self, excluded: frozenset = frozenset()) -> list:
         return [
