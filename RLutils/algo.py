@@ -391,6 +391,9 @@ class PredictivePPOAlgo:
         self.continuous_actions = isinstance(self.env.action_space, gym.spaces.Box)
         self.log_joint_probabilities = bool(joint_probabilities) and not self.continuous_actions
         self.value_heads = int(getattr(acmodel, "value_heads", 1))
+        # Goal-conditioned PPO can end episodes without resetting the
+        # environment (see GoalConditionedPPOAlgo.continuous_episodes)
+        self.continuous_episodes = getattr(self, "continuous_episodes", False)
         # Environment frames collected so far, which drive the task ramp.  The
         # training script sets it when a run resumes from a checkpoint.
         self.total_frames = 0
@@ -1023,10 +1026,13 @@ class PredictivePPOAlgo:
                 any_done = True
                 self._handle_episode_end(i)
         
-        # If no episode ended, count the last frame as done
-        if not any_done:
+        # If no episode ended, count the last frame as done (except in
+        # continuous episodes, whose environment is never reset)
+        if not any_done and not self.continuous_episodes:
             self._handle_episode_end(self.config.num_frames - 1)
-        elif not done:
+        elif self.experience_buffer.done_indices[-1] != self.config.num_frames:
+            # The last trajectory is still running (also across goal changes
+            # of continuous episodes): close it for the pRNN
             self._mark_rollout_end()
         
         # Compute augmented rewards
@@ -1490,6 +1496,14 @@ class GoalConditionedPPOAlgo(PredictivePPOAlgo):
     distance to the goal at every step of a goal episode.
 
     ``learn_goals=False`` (validation) leaves the pool and threshold unchanged.
+
+    With ``continuous_episodes`` an episode that ends by reaching its goal,
+    a timeout or an exploratory cut does not reset the environment: the agent
+    stays where it is and gets a new goal (and task/exploration draw).  The
+    task return is still cut there, but the pRNN state, SR and trajectory run
+    on: no pRNN reset, and curious rewards, pRNN training and internal-reward
+    state pairs do not stop at the goal change.  Only a termination by the
+    environment itself resets it.
     """
 
     def __init__(
@@ -1505,6 +1519,7 @@ class GoalConditionedPPOAlgo(PredictivePPOAlgo):
         check_location: bool = False,
         exclude_loactions: Optional[np.ndarray] = None,
         learn_goals: bool = True,
+        continuous_episodes: bool = False,
         video_log_freq: Optional[int] = None,
         video_folder: Optional[str] = None,
         video_ext: str = '',
@@ -1542,6 +1557,8 @@ class GoalConditionedPPOAlgo(PredictivePPOAlgo):
         self.goal_threshold = goal_threshold
         self.check_location = check_location
         self.learn_goals = learn_goals
+        self.continuous_episodes = bool(continuous_episodes)
+        self._env_terminated = False
         self._goals_unavailable = 0
         self._video_ext = video_ext
         self.video_log_freq = int(video_log_freq) if video_log_freq is not None else 0
@@ -1711,6 +1728,10 @@ class GoalConditionedPPOAlgo(PredictivePPOAlgo):
         else:
             return 0.0, False
 
+    def _restart_time_limit(self) -> None:
+        """Give a continuous episode's new goal MiniGrid's full step budget."""
+        self.env.env.unwrapped.step_count = 0
+
     def _check_goal_state(self, SR_new: torch.Tensor) -> Tuple[float, Optional[float], bool]:
         """Goal check by representation: ``(reward_new, reward_past, reached)``."""
         distance = self._goal_distance(SR_new)
@@ -1757,6 +1778,7 @@ class GoalConditionedPPOAlgo(PredictivePPOAlgo):
         # Exploratory episodes (rewards.exploration, task ramp) have no goal
         reward, terminated, truncated, cut = self._exploration_step(reward, terminated, truncated)
         done = terminated or truncated or cut
+        self._env_terminated = terminated
 
         new_loc = self._get_agent_pos()
         current_hd = self._get_hd()
@@ -1823,7 +1845,14 @@ class GoalConditionedPPOAlgo(PredictivePPOAlgo):
 
         self._stop_episode_video_recorder()
 
-        super()._handle_episode_end(idx)
+        if self.continuous_episodes and not self._env_terminated:
+            # A new goal from where the agent is: no reset of the environment,
+            # pRNN state or SR, and no pRNN trajectory boundary
+            self.metrics.episode_done(task=self.task_episode)
+            self._restart_time_limit()
+            self._start_episode_task()
+        else:
+            super()._handle_episode_end(idx)
 
         # super()._handle_episode_end resets the env, so refresh current location.
         self.loc = self._get_agent_pos()
