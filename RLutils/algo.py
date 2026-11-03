@@ -1202,23 +1202,39 @@ class PredictivePPOAlgo:
         losses = []
         min_actions = min_prnn_trajectory_actions(pN)
 
+        # Continuous episodes leave one trajectory per rollout; train on
+        # consecutive pieces of at most seqdur steps, one update each, so the
+        # pRNN keeps the update rate of seqdur-step trajectories.
+        chunk = (
+            int(self.spatial_config.predictive_net.seqdur) if self.continuous_episodes
+            else None
+        )
+        skipped = 0
         for idx in range(1, len(done_indices)):
             start_episode = done_indices[idx - 1]
             end_episode = done_indices[idx]
-            if end_episode - start_episode < min_actions:
-                continue  # too short for a rollout pRNN's k-step predictions
-            obs_for_pN = buffer.obss[start_episode:end_episode] + [buffer.last_observations[idx - 1]]
-            state = None if episode_hds is None else {"agent_dir": episode_hds[idx - 1]}
-
-            obs, act = prnn_inputs(
-                pN, obs_for_pN, actions[start_episode:end_episode], state
-            )
-            loss, _, _ = pN.trainStep(obs.to(self.device), act.to(self.device))
-            pN.numTrainingEpochs += 1
-            losses.append(float(loss))
+            obs_trajectory = buffer.obss[start_episode:end_episode] + [buffer.last_observations[idx - 1]]
+            act_trajectory = actions[start_episode:end_episode]
+            length = end_episode - start_episode
+            for start in range(0, length, chunk or length):
+                end = min(start + (chunk or length), length)
+                if end - start < min_actions:
+                    skipped += 1
+                    continue  # too short for a rollout pRNN's k-step predictions
+                state = (
+                    None if episode_hds is None
+                    else {"agent_dir": episode_hds[idx - 1][start:end + 1]}
+                )
+                obs, act = prnn_inputs(
+                    pN, obs_trajectory[start:end + 1], act_trajectory[start:end], state
+                )
+                loss, _, _ = pN.trainStep(obs.to(self.device), act.to(self.device))
+                pN.numTrainingEpochs += 1
+                losses.append(float(loss))
 
         self._logs_update["pRNN_loss"] = losses
-        self._logs_update["pRNN_trajectories_skipped"] = len(done_indices) - 1 - len(losses)
+        self._logs_update["pRNN_trajectories_skipped"] = skipped
+        self._logs_update["pRNN_updates"] = len(losses)
         buffer.reset_trajectories()
     
     def update_parameters(self, exps: DictList, update_params: bool = True) -> None:
@@ -1335,8 +1351,9 @@ class PredictivePPOAlgo:
 
         if logs_update.get("pRNN_loss"):
             processed["pRNN loss"] = float(np.mean(logs_update["pRNN_loss"]))
-        if "pRNN_trajectories_skipped" in logs_update:
-            processed["pRNN_trajectories_skipped"] = logs_update["pRNN_trajectories_skipped"]
+        for key in ("pRNN_trajectories_skipped", "pRNN_updates"):
+            if key in logs_update:
+                processed[key] = logs_update[key]
         
         # Process values and advantages
         if "values" in logs_collect:
