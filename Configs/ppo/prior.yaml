@@ -1,2 +1,5 @@
 prior_kl_coef: 0.1 # Coefficient for KL divergence penalty toward policy prior (0 = disabled)
-policy_prior: [0.15, 0.15, 0.6, 0.1] # Prior action probabilities e.g. [0.15, 0.15, 0.6, 0.1]; must sum to 1
+# MiniGrid's 7 actions: the random agent's left/right/forward/pickup, and 1e-3
+# for drop/toggle/done (KL(policy || prior) needs every probability > 0).
+# Normalised to sum to 1.
+policy_prior: [0.15, 0.15, 0.6, 0.1, 0.001, 0.001, 0.001]

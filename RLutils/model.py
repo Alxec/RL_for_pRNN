@@ -151,6 +151,26 @@ class ACModel(nn.Module, torch_ac.ACModel):
             nn.Linear(64, self.value_heads)
         )
 
+    def init_policy_prior(self, prior, weight_scale=0.01):
+        """Start the policy at the action distribution ``prior`` in every state.
+
+        The output layer's bias becomes ``log(prior)`` and its weights are
+        scaled by ``weight_scale``, so the logits are close to ``log(prior)``
+        whatever the input.  Training is then free to move away from it.
+        """
+        prior = torch.as_tensor(prior, dtype=torch.float32)
+        if prior.shape != (self.act_dim,):
+            raise ValueError(
+                f"The policy prior has {prior.numel()} probabilities but the "
+                f"policy has {self.act_dim} actions."
+            )
+        if torch.any(prior <= 0):
+            raise ValueError("A policy prior used as initialisation needs positive probabilities.")
+        head = self.actor[-1]
+        with torch.no_grad():
+            head.weight.mul_(weight_scale)
+            head.bias.copy_(torch.log(prior / prior.sum()))
+
     @property
     def embedding_size(self):
         if self.with_HD:

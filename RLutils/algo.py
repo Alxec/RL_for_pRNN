@@ -631,6 +631,14 @@ class PredictivePPOAlgo:
         if prior is not None and kl_coef > 0.0:
             # Accept list/ListConfig/tensor
             prior_list = OmegaConf.to_container(prior) if hasattr(prior, '_metadata') else list(prior)
+            if len(prior_list) != self.env.action_space.n:
+                raise ValueError(
+                    f"ppo.policy_prior has {len(prior_list)} probabilities but the "
+                    f"environment has {self.env.action_space.n} actions."
+                )
+            if min(prior_list) <= 0:
+                # KL(policy || prior) is infinite where the prior is 0
+                raise ValueError("ppo.policy_prior probabilities must all be positive.")
             prior_tensor = torch.tensor(prior_list, dtype=torch.float32, device=self.device)
             prior_tensor = prior_tensor / prior_tensor.sum()  # normalise defensively
             self.policy_prior = prior_tensor

@@ -64,7 +64,7 @@ ppo:
     num_frames: 2048 # Number of frames before update
     recurrence: 1 # Whether to use RNN for memory (1 = don't use, other number = number of recurrent steps)
     prior_kl_coef: 0.0 # Coefficient for KL divergence penalty toward policy prior (0 = disabled)
-    policy_prior: null # Prior action probabilities e.g. [0.15, 0.15, 0.6, 0.1]; must sum to 1
+    policy_prior: null # Prior action probabilities: one positive value per action (see ppo/prior.yaml); normalised to sum 1
 
 
 SR:
