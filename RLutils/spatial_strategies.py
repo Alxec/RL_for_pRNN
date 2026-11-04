@@ -141,11 +141,17 @@ class PredictiveNetworkSR(SpatialRepresentationStrategy):
         
         with torch.no_grad():
             SR = self.pN.predict_single(obs_pN[:, :-1, :], act_pN).squeeze(dim=0)
-        return SR
-    
+        return self._apply_mask(SR)
+
     def _apply_mask(self, SR: torch.Tensor) -> torch.Tensor:
-        """Apply masking to spatial representation if configured."""
-        if self.mask_indices is not None:
+        """Hide the masked units from the SR's consumers, not from the pRNN.
+
+        ``predict_single`` returns the pRNN's recurrent state itself, so the
+        masked units are zeroed in a copy: the pRNN keeps running unchanged
+        and only the actor-critic and the internal rewards lose them.
+        """
+        if self.mask_indices is not None and len(self.mask_indices) > 0:
+            SR = SR.clone()
             SR[0, self.mask_indices] = 0
         return SR
     
