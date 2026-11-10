@@ -36,6 +36,17 @@ class RewardStrategy(ABC):
         pass
 
 
+def cosine_distance(u: torch.Tensor, v: torch.Tensor) -> float:
+    """Cosine distance, taken as 1 (no similarity) when either vector is all-zero.
+
+    With most units masked (``mask_internal``), the few left can all be
+    silent at a step, which would make the distance 0/0.
+    """
+    if not (bool(u.any()) and bool(v.any())):
+        return 1.0
+    return cosine(u, v)
+
+
 class InternalRewardStrategy(RewardStrategy):
     """Compute internal rewards based on spatial representation similarity."""
     
@@ -98,7 +109,9 @@ class InternalRewardStrategy(RewardStrategy):
                 x[:, self.mask_indices] = 0
         rewards = torch.zeros(SRs.shape[0])
         for t in torch.nonzero(has_reference).flatten().tolist():
-            rewards[t] = cosine(SRs_cpu[t], refs_cpu[t]) - cosine(next_cpu[t], refs_cpu[t])
+            rewards[t] = (
+                cosine_distance(SRs_cpu[t], refs_cpu[t]) - cosine_distance(next_cpu[t], refs_cpu[t])
+            )
         return self.k_int * rewards.to(self.device)
 
     def update_reference(self, SR: torch.Tensor):
